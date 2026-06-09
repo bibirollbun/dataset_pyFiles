@@ -1,0 +1,202 @@
+from dataclasses import dataclass
+from typing import List, Dict, Any, Optional
+import time
+import concurrent.futures
+import uuid
+
+#-----------------------
+# Data Classes
+#-----------------------
+@dataclass
+class LearningObjective:
+    topic: str
+    difficulty: float
+    prerequisites: List[str]
+
+@dataclass
+class Resource:
+    title: str
+    url: str
+    summary: str
+    relevance: float
+
+@dataclass
+class Flashcard:
+    question: str
+    answer: str
+    ease: float = 2.5
+
+
+#---------------------------
+#In-memory session service
+#---------------------------
+class InMemorySessionService:
+    """Simple session store keyed by session_id."""
+    def __init__(self):
+        self.session: Dict[str, Dict[str, Any]] = {}
+
+    def create_session(self, user_id: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+        sid = str(uuid.uuid4())
+        self.session[sid] = {
+            "user_id": user_id,
+            "created_at": time.time(),
+            "metadata": metadata or {},
+            "state": {}
+        }
+        return sid
+
+    def get(self, session_id: str) -> Dict[str, Any]:
+        return self.session.get(session_id, {})
+
+    def set_state(self, session_id: str, key: str, value: Any):
+        if session_id not in self.session:
+            raise KeyError("session not found")
+        self.session[session_id]["state"][key] = value
+
+    def get_state(self, session_id: str, key: str, default=None):
+        return self.session.get(session_id, {}).get("state", {}).get(key, default)
+
+
+#----------------------------
+# Mock LLM Agent
+#----------------------------
+class MockLLMAgent:
+    def summarize(self, text: str, max_length: int = 60) -> str:
+        return (text[:max_length] + '---') if len(text) > max_length else text
+
+    def explain(self, topic: str, level: str = 'intro') -> str:
+        return f"Explanation ({level}) for {topic}: concise overview."
+
+    def generate_quiz(self, topic: str, n_questions: int = 3) -> List[Dict[str, Any]]:
+        qs = []
+        for i in range(1, n_questions + 1):
+            qs.append({
+                "q": f"Sample question {i} about {topic}.",
+                "a": f"Short model answer for question {i} on {topic}."
+            })
+        return qs
+
+    def answer_query(self, topic: str, query_type: str) -> str:
+        if query_type == "prerequisites":
+            return (f"Prerequisites for {topic}: Python, algebra, probability.")
+        if query_type == "key_concepts":
+            return (f"Key concepts for {topic}: algorithms, complexity, examples.")
+        if query_type == "practice_problems":
+            return (f"Practice for {topic}: coding tasks, small experiments.")
+        return f"General help for {topic} regarding '{query_type}'."
+
+
+#-----------------------
+#Other agents
+#-----------------------
+class ContentSearchAgent:
+    def run(self, topic: str) -> List[Resource]:
+        time.sleep(0.4)
+        playlist = "https://www.youtube.com/playlist?list=PlzJwCIvZuAFY-jBJS0-LlFB0dP469vsMG"
+        return [
+            Resource(
+                title=f"{topic} - Playlist by Mr Bappaditya",
+                url=playlist,
+                summary=f"A curated playlist for {topic}.",
+                relevance=0.95
+            ),
+            Resource(
+                title=f"{topic} - Deep dive article",
+                url="https://example.com/deep",
+                summary=f"In-depth article on {topic}.",
+                relevance=0.75
+            )
+        ]
+
+
+class FlashcardAgent:
+    def __init__(self, llm_agent: MockLLMAgent):
+        self.llm = llm_agent
+
+    def run(self, topic: str, n_card: int = 5) -> List[Flashcard]:
+        cards = []
+        for i in range(n_card):
+            q = f"What is the key idea {i+1} in {topic}?"
+            a = self.llm.explain(topic, level='short')
+            cards.append(Flashcard(question=q, answer=a))
+        return cards
+
+
+#--------------------------
+# Study Coordinator
+#--------------------------
+class StudyCoordinator:
+    def __init__(self, session_service: InMemorySessionService):
+        self.llm = MockLLMAgent()
+        self.search_agent = ContentSearchAgent()
+        self.flashcard_agent = FlashcardAgent(self.llm)
+        self.sessions = session_service
+
+    def create_or_get_session(self, user_id: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+        return self.sessions.create_session(user_id, metadata)
+
+    def plan_for(self, session_id: str, topics: List[str], weekly_hours: int = 5) -> Dict[str, Any]:
+        self.sessions.set_state(session_id, 'topics', topics)
+        self.sessions.set_state(session_id, 'weekly_hours', weekly_hours)
+
+        results = {"resources": {}, "flashcards": {}, "quizzes": {}, "informative_queries": {}}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+            future_to_topic_search = {ex.submit(self.search_agent.run, t): t for t in topics}
+            future_to_topic_flash = {ex.submit(self.flashcard_agent.run, t, 4): t for t in topics}
+
+            for fut in concurrent.futures.as_completed(future_to_topic_search):
+                topic = future_to_topic_search[fut]
+                results['resources'][topic] = fut.result()
+
+            for fut in concurrent.futures.as_completed(future_to_topic_flash):
+                topic = future_to_topic_flash[fut]
+                results['flashcards'][topic] = fut.result()
+
+        for topic in topics:
+            results['quizzes'][topic] = self.llm.generate_quiz(topic, 3)
+
+        query_types = ["prerequisites", "key_concepts", "practice_problems"]
+        for topic in topics:
+            answers = {}
+            for qt in query_types:
+                answers[qt] = self.llm.answer_query(topic, qt)
+            results['informative_queries'][topic] = answers
+
+        self.sessions.set_state(session_id, 'last_plan', results)
+        return results
+
+
+#-------------------
+#Demo Run
+#-------------------
+session_service = InMemorySessionService()
+coord = StudyCoordinator(session_service)
+
+sid = coord.create_or_get_session(user_id='user_123', metadata={'preferred_format': 'videos+problems'})
+print('created session id:', sid)
+
+topics = [
+    'Day 1 - Foundations of AI Agents',
+    'Day 2 - Tools & Integrations',
+    'Day 3 - Planning & Orchestration',
+    'Day 4 - Budgeting & Optimization',
+    'Day 5 - Deployment & Observability'
+]
+
+plan_result = coord.plan_for(sid, topics, weekly_hours=10)
+
+print('\n--- Plan Summary (topics) ---')
+for t in topics:
+    print(f"\nTopic: {t}")
+    for r in plan_result['resources'][t]:
+        print(f"   - {r.title} | {r.url}")
+    print(f" Flashcards: {len(plan_result['flashcards'][t])}")
+
+    print(" Informative queries:")
+    for qtype, answer in plan_result['informative_queries'][t].items():
+        print(f"   - {qtype}: {answer}")
+
+print('\nSession stored state keys:', list(session_service.get(sid).get('state', {}).keys()))
+
+

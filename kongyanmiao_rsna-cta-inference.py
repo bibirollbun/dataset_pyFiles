@@ -1,0 +1,467 @@
+import os
+import gc
+import re
+import cv2
+import math
+import numpy as np
+import pandas as pd
+import polars as pl
+import pydicom
+import torch
+import torch.nn as nn
+import timm
+from collections import defaultdict
+from typing import List, Tuple
+import shutil
+from sklearn.metrics import roc_auc_score
+
+# Kaggle server
+import kaggle_evaluation.rsna_inference_server
+
+# ========= Competition schema =========
+ID_COL = 'SeriesInstanceUID'
+LABEL_COLS = [
+    'Left Infraclinoid Internal Carotid Artery',
+    'Right Infraclinoid Internal Carotid Artery',
+    'Left Supraclinoid Internal Carotid Artery',
+    'Right Supraclinoid Internal Carotid Artery',
+    'Left Middle Cerebral Artery',
+    'Right Middle Cerebral Artery',
+    'Anterior Communicating Artery',
+    'Left Anterior Cerebral Artery',
+    'Right Anterior Cerebral Artery',
+    'Left Posterior Communicating Artery',
+    'Right Posterior Communicating Artery',
+    'Basilar Tip',
+    'Other Posterior Circulation',
+    'Aneurysm Present',
+]
+
+# Optional allowlist (not used in modeling; provided for compliance/reference)
+DICOM_TAG_ALLOWLIST = [
+    'BitsAllocated','BitsStored','Columns','FrameOfReferenceUID','HighBit',
+    'ImageOrientationPatient','ImagePositionPatient','InstanceNumber','Modality',
+    'PatientID','PhotometricInterpretation','PixelRepresentation','PixelSpacing',
+    'PlanarConfiguration','RescaleIntercept','RescaleSlope','RescaleType','Rows',
+    'SOPClassUID','SOPInstanceUID','SamplesPerPixel','SliceThickness',
+    'SpacingBetweenSlices','StudyInstanceUID','TransferSyntaxUID',
+]
+
+# ========= Enhanced Inference config =========
+IMG_SIZE = 224
+OFFSETS = (-2, -1, 0, 1, 2)   # window length 5
+IN_CHANS = len(OFFSETS)
+BATCH_SIZE = 16
+AGGREGATE = "max"  # max/mean/topk_mean
+USE_ROI = False     # coords not available on test → use same stream for full+roi
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Enhanced preprocessing parameters
+ENHANCE_CONTRAST = True
+USE_MULTI_SCALE = False  # 多尺度处理会显著增加推理时间，根据需求开启
+ADAPTIVE_NORMALIZATION = True
+REMOVE_OUTLIERS = True
+
+# Where model weights are stored. Attach a Dataset with your .pth files if needed.
+CANDIDATE_MODEL_DIRS = [
+    "/kaggle/input/rsna-2025-ia-ct-224-efficientnet/pytorch/default/1",        # attached datasets
+    "/kaggle/working",      # runtime dir
+    ".",                    # current dir
+]
+
+# ========= 初始化清理 =========
+# 在代码开始时确保共享目录是空的
+SHARED_DIR = '/kaggle/shared'
+if os.path.exists(SHARED_DIR):
+    shutil.rmtree(SHARED_DIR, ignore_errors=True)
+os.makedirs(SHARED_DIR, exist_ok=True)
+
+# ========= Compatible Model Definition =========
+class CompatibleHybridAneurysmModel(nn.Module):
+    """与现有权重文件兼容的模型结构"""
+    def __init__(self, base_model_name: str, num_classes: int):
+        super().__init__()
+        
+        # Use timm backbone as feature extractor
+        self.backbone = timm.create_model(base_model_name, in_chans=IN_CHANS, num_classes=0, pretrained=False)
+        self.feature_dim = self.backbone.num_features
+        
+        # 与原始权重兼容的结构
+        self.coord_fc = nn.Sequential(
+            nn.Linear(2, 32), 
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 64)
+        )
+        
+        # 与原始权重兼容的分类器
+        self.fc = nn.Sequential(
+            nn.Dropout(0.3), 
+            nn.Linear(self.feature_dim * 2 + 64, num_classes)
+        )
+
+    def forward(self, x_full: torch.Tensor, x_roi: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        f_full = self.backbone(x_full)
+        f_roi  = self.backbone(x_roi)
+        f_coord = self.coord_fc(coords.float())
+        return self.fc(torch.cat([f_full, f_roi, f_coord], dim=1))
+
+# ========= Enhanced Preprocessing Helpers =========
+def sort_dicom_slices(filepaths: List[str]):
+    dicoms = [pydicom.dcmread(fp, force=True) for fp in filepaths]
+    try:
+        dicoms.sort(key=lambda d: float(d.ImagePositionPatient[2]))
+    except Exception:
+        dicoms.sort(key=lambda d: int(getattr(d, 'InstanceNumber', 0)))
+    return dicoms
+
+def apply_contrast_enhancement(img: np.ndarray) -> np.ndarray:
+    """应用对比度增强"""
+    if not ENHANCE_CONTRAST:
+        return img
+    
+    # CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    
+    # 归一化到0-255
+    img_normalized = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
+    img_uint8 = img_normalized.astype(np.uint8)
+    
+    # 应用CLAHE
+    enhanced = clahe.apply(img_uint8)
+    
+    # 转换回原始范围
+    return enhanced.astype(np.float32)
+
+def remove_outliers(img: np.ndarray) -> np.ndarray:
+    """去除异常值"""
+    if not REMOVE_OUTLIERS:
+        return img
+    
+    # 使用百分位数裁剪异常值
+    p_low, p_high = np.percentile(img, [1, 99])
+    img_clipped = np.clip(img, p_low, p_high)
+    
+    return img_clipped
+
+def adaptive_normalization(img: np.ndarray) -> np.ndarray:
+    """自适应归一化"""
+    if not ADAPTIVE_NORMALIZATION:
+        mean = img.mean()
+        std = img.std() + 1e-6
+        return (img - mean) / std
+    
+    # 基于图像统计的自适应归一化
+    mean = np.mean(img)
+    std = np.std(img)
+    
+    # 如果标准差太小，使用全局统计
+    if std < 1e-4:
+        std = 1.0
+    
+    # 应用归一化
+    normalized = (img - mean) / std
+    
+    # 进一步限制极端值
+    normalized = np.clip(normalized, -3.0, 3.0)
+    
+    return normalized
+
+def multi_scale_processing(img: np.ndarray) -> np.ndarray:
+    """多尺度处理并选择最佳尺度"""
+    if not USE_MULTI_SCALE:
+        return cv2.resize(img, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+    
+    scales = [0.8, 1.0, 1.2]
+    scaled_imgs = []
+    
+    for scale in scales:
+        new_size = int(IMG_SIZE * scale)
+        scaled = cv2.resize(img, (new_size, new_size), interpolation=cv2.INTER_AREA)
+        
+        # 中心裁剪回目标尺寸
+        start_h = (scaled.shape[0] - IMG_SIZE) // 2
+        start_w = (scaled.shape[1] - IMG_SIZE) // 2
+        cropped = scaled[start_h:start_h+IMG_SIZE, start_w:start_w+IMG_SIZE]
+        scaled_imgs.append(cropped)
+    
+    # 基于图像质量选择最佳尺度（使用对比度作为指标）
+    contrast_scores = [np.std(img) for img in scaled_imgs]
+    best_idx = np.argmax(contrast_scores)
+    
+    return scaled_imgs[best_idx]
+
+def enhanced_series_to_tensor_chw(dicoms) -> np.ndarray:
+    """增强的DICOM序列到张量转换"""
+    resized = []
+    
+    for d in dicoms:
+        arr = d.pixel_array
+        if arr is None or arr.size == 0:
+            # 创建空白图像作为fallback
+            arr = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+            resized.append(arr)
+            continue
+        
+        arr = arr.astype(np.float32)
+        
+        # 应用预处理流水线
+        if REMOVE_OUTLIERS:
+            arr = remove_outliers(arr)
+        
+        if ENHANCE_CONTRAST:
+            arr = apply_contrast_enhancement(arr)
+        
+        # 多尺度处理或直接调整大小
+        arr = multi_scale_processing(arr)
+        
+        resized.append(arr)
+    
+    if len(resized) == 0:
+        # fallback to zeros to avoid crashes (rare)
+        vol = np.zeros((1, IMG_SIZE, IMG_SIZE), dtype=np.float32)
+    else:
+        vol = np.stack(resized, axis=0)  # [N,H,W]
+    
+    # 应用自适应归一化
+    if ADAPTIVE_NORMALIZATION:
+        # 对每个切片独立归一化以保持局部特征
+        normalized_slices = []
+        for slice_img in vol:
+            normalized_slice = adaptive_normalization(slice_img)
+            normalized_slices.append(normalized_slice)
+        vol = np.stack(normalized_slices, axis=0)
+    else:
+        # 原始的整体归一化
+        mean = float(vol.mean())
+        std = float(vol.std()) + 1e-6
+        vol = (vol - mean) / std
+    
+    # return as CHW for convenience when building windows
+    return np.transpose(vol, (0, 1, 2))  # still [N,H,W]; windows will transpose to CHW later
+
+def take_window_from_volume(vol_nhw: np.ndarray, center_idx: int, offsets=OFFSETS) -> np.ndarray:
+    # vol_nhw: [N,H,W] float32
+    N = vol_nhw.shape[0]
+    idxs = [min(max(0, center_idx + o), N - 1) for o in offsets]
+    win = vol_nhw[idxs, :, :]              # [len(offsets),H,W]
+    return win.astype(np.float32, copy=False)
+
+def coords_to_px(coords: np.ndarray, img_size: int) -> Tuple[int, int]:
+    # coords are zeros on test; keep util for API compatibility
+    x, y = float(coords[0]), float(coords[1])
+    if 0.0 <= x <= 1.0 and 0.0 <= y <= 1.0:
+        x *= img_size; y *= img_size
+    return int(round(x)), int(round(y))
+
+def crop_and_resize_chw(img_chw: np.ndarray, x1: int, y1: int, x2: int, y2: int, out_size: int) -> np.ndarray:
+    img_hwc = np.transpose(np.asarray(img_chw), (1, 2, 0))
+    crop = img_hwc[y1:y2, x1:x2]
+    if crop.size == 0 or crop.shape[0] < 2 or crop.shape[1] < 2:
+        crop = img_hwc
+    crop = crop.astype(np.float32, copy=False)
+    crop = np.ascontiguousarray(crop)
+    crop = cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_AREA)
+    return np.transpose(crop, (2, 0, 1))
+
+def window_to_full_and_roi(win_chw: np.ndarray, coords: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if USE_ROI and np.any(coords != 0):
+        cx, cy = coords_to_px(coords, IMG_SIZE)
+        r = max(12, int(0.15 * IMG_SIZE))
+        x1 = max(0, cx - r); y1 = max(0, cy - r)
+        x2 = min(IMG_SIZE - 1, cx + r); y2 = min(IMG_SIZE - 1, cy + r)
+        roi = crop_and_resize_chw(win_chw, x1, y1, x2, y2, IMG_SIZE)
+        return win_chw, roi
+    # No coords on test → identical streams
+    return win_chw, win_chw
+
+# ========= Checkpoint discovery/loading =========
+_ckpt_cache = None  # type: ignore
+_models = None      # type: ignore
+
+_ckpt_regex = re.compile(r"([^/\\]+)_hybrid_fold(\d+)\.pth$")
+
+def discover_checkpoints() -> List[Tuple[str, str]]:
+    # Returns list of (arch_name, path)
+    found: List[Tuple[str, str]] = []
+    for base in CANDIDATE_MODEL_DIRS:
+        if not os.path.isdir(base):
+            continue
+        for root, _, files in os.walk(base):
+            for f in files:
+                if f.endswith('.pth') and ('_hybrid_fold' in f or '_best_wAUC' in f):
+                    m = _ckpt_regex.search(f)
+                    if m:
+                        arch = m.group(1)
+                    else:
+                        # heuristic: arch is everything before first _fold or _hybrid
+                        arch = f.split('_hybrid_fold')[0].split('_fold')[0]
+                    found.append((arch, os.path.join(root, f)))
+    # stable ordering
+    found.sort(key=lambda x: x[1])
+    return found
+
+def load_compatible_model(arch_name: str, weight_path: str) -> nn.Module:
+    """加载与现有权重文件兼容的模型"""
+    try:
+        # 首先尝试加载兼容模型
+        model = CompatibleHybridAneurysmModel(base_model_name=arch_name, num_classes=len(LABEL_COLS))
+        state = torch.load(weight_path, map_location=DEVICE)
+        
+        # 处理DataParallel包装的权重
+        if isinstance(state, dict) and any(k.startswith('module.') for k in state.keys()):
+            state = {k.replace('module.', '', 1): v for k, v in state.items()}
+        
+        # 加载权重
+        model.load_state_dict(state, strict=True)
+        print(f"Successfully loaded compatible model: {arch_name}")
+        
+    except Exception as e:
+        print(f"Failed to load model {arch_name}: {e}")
+        raise
+    
+    model.eval().to(DEVICE)
+    return model
+
+def get_models() -> List[Tuple[str, nn.Module]]:
+    global _ckpt_cache, _models
+    if _models is not None:
+        return _models
+    _ckpt_cache = discover_checkpoints()
+    if not _ckpt_cache:
+        raise FileNotFoundError('No model checkpoints found. Attach a dataset with *_hybrid_fold*.pth files.')
+    mods: List[Tuple[str, nn.Module]] = []
+    for arch, path in _ckpt_cache:
+        try:
+            m = load_compatible_model(arch, path)
+            mods.append((arch, m))
+        except Exception as e:
+            print(f"Skipping incompatible checkpoint {path}: {e}")
+            continue
+    if not mods:
+        raise RuntimeError('Failed to load any checkpoints from discovered files.')
+    _models = mods
+    print(f"Loaded {len(_models)} models")
+    return _models
+
+# ========= Per-series sliding-window inference =========
+@torch.no_grad()
+def predict_series_probs(dicoms) -> np.ndarray:
+    models = get_models()
+    # Build normalized volume [N,H,W] using enhanced preprocessing
+    vol = enhanced_series_to_tensor_chw(dicoms)
+    N = vol.shape[0]
+    # Prepare coords zeros on test
+    coords = np.zeros((N, 2), dtype=np.float32)
+
+    all_model_probs = []
+    for _, model in models:
+        batch_full, batch_roi, batch_coords = [], [], []
+        probs_accum = []
+        for c in range(N):
+            win = take_window_from_volume(vol, c, OFFSETS)   # [C,H,W]
+            win_chw = np.transpose(win, (0, 1, 2))           # still [C,H,W]
+            full_chw, roi_chw = window_to_full_and_roi(win_chw, coords[c])
+            batch_full.append(full_chw)
+            batch_roi.append(roi_chw)
+            batch_coords.append(coords[c])
+            # flush by batch
+            if len(batch_full) == BATCH_SIZE or c == N - 1:
+                xb_full = torch.from_numpy(np.stack(batch_full).astype(np.float32)).to(DEVICE)
+                xb_roi  = torch.from_numpy(np.stack(batch_roi).astype(np.float32)).to(DEVICE)
+                cb      = torch.from_numpy(np.stack(batch_coords).astype(np.float32)).to(DEVICE)
+                logits = model(xb_full, xb_roi, cb)
+                probs = torch.sigmoid(logits).cpu().numpy()
+                probs_accum.append(probs)
+                batch_full.clear(); batch_roi.clear(); batch_coords.clear()
+        probs_all = np.concatenate(probs_accum, axis=0) if probs_accum else np.zeros((1, len(LABEL_COLS)), dtype=np.float32)
+        if AGGREGATE == 'max':
+            series_prob = probs_all.max(axis=0)
+        elif AGGREGATE == 'mean':
+            series_prob = probs_all.mean(axis=0)
+        else:  # topk_mean
+            k = max(1, N // 5)
+            series_prob = np.sort(probs_all, axis=0)[-k:].mean(axis=0)
+        all_model_probs.append(series_prob)
+        # free memory between models
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    # ensemble (probability average)
+    return np.mean(np.stack(all_model_probs, axis=0), axis=0)
+
+# ========= Kaggle-required predict(series_path) =========
+def predict(series_path: str) -> pl.DataFrame | pd.DataFrame:
+    series_id = os.path.basename(series_path)
+
+    # Try reading just one DICOM to check the Modality
+    first_dcm = None
+    for root, _, files in os.walk(series_path):
+        for f in files:
+            if f.endswith('.dcm'):
+                try:
+                    first_dcm = pydicom.dcmread(os.path.join(root, f), stop_before_pixels=True)
+                    break
+                except Exception:
+                    continue
+        if first_dcm:
+            break
+
+    # Check modality
+    modality = getattr(first_dcm, 'Modality', '').upper() if first_dcm else ''
+    if modality != 'CT':
+        zeros = [[series_id] + [0.0] * len(LABEL_COLS)]
+        predictions = pl.DataFrame(data=zeros, schema=[ID_COL, *LABEL_COLS], orient='row')
+        return predictions.drop(ID_COL)
+
+    # Proceed with full DICOM loading and processing
+    filepaths = []
+    for root, _, files in os.walk(series_path):
+        for f in files:
+            if f.endswith('.dcm'):
+                filepaths.append(os.path.join(root, f))
+    dicoms = sort_dicom_slices(filepaths)
+
+    # Inference with enhanced preprocessing
+    probs = predict_series_probs(dicoms)
+
+    # Build output (one row)
+    data = [[series_id] + probs.tolist()]
+    predictions = pl.DataFrame(data=data, schema=[ID_COL, *LABEL_COLS], orient='row')
+
+    # Server expects features only (without ID_COL)
+    return predictions.drop(ID_COL)
+
+# ========= Local testing code =========
+if __name__ == "__main__":
+    import random
+    from IPython.display import display
+    
+    # Load the data
+    df = pd.read_csv("/kaggle/input/rsna-intracranial-aneurysm-detection/train.csv")
+    
+    # Filter only CTA modality
+    cta_df = df[df['Modality'] == 'CTA']
+    
+    # Pick a random SeriesInstanceUID from CTA cases
+    DESIRED_SERIES = random.choice(cta_df['SeriesInstanceUID'].unique())
+    
+    # Filter the CTA DataFrame for the selected SeriesInstanceUID
+    filtered_df = cta_df[cta_df['SeriesInstanceUID'] == DESIRED_SERIES].reset_index(drop=True)
+    
+    # Display
+    print("Randomly selected SeriesInstanceUID:", DESIRED_SERIES)
+    display(filtered_df)
+
+# ========= Start RSNA server =========
+# 在启动服务器前再次确保共享目录是空的
+if os.path.exists(SHARED_DIR):
+    shutil.rmtree(SHARED_DIR, ignore_errors=True)
+os.makedirs(SHARED_DIR, exist_ok=True)
+
+inference_server = kaggle_evaluation.rsna_inference_server.RSNAInferenceServer(predict)
+
+if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+    inference_server.serve()
+else:
+    inference_server.run_local_gateway()
+    display(pl.read_parquet('/kaggle/working/submission.parquet'))
+

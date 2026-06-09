@@ -1,0 +1,595 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+
+
+!pip install efficientnet_pytorch
+
+
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, random_split
+from torchvision import datasets, models, transforms
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import warnings
+import time
+import cv2
+warnings.filterwarnings('ignore')
+
+
+start_time = time.time()
+BASE_DIR = "/kaggle/input/hms-harmful-brain-activity-classification/"
+
+
+brain_activities = ['Seizure', 'GPD', 'LRDA', 'Other', 'GRDA', 'LPD']
+activity_mapping = {activity: idx for idx, activity in enumerate(brain_activities)}
+
+
+df = pd.read_csv(f"{BASE_DIR}train.csv")
+
+df_toy = df.sample(frac=0.3, random_state=42)
+# Split 80% Train, 20% Temp (Validation + Test)
+train_df, temp_df = train_test_split(df_toy, test_size=0.4, random_state=42)
+
+# Split 10% Validation, 10% Test from Temp
+val_df, test_df = train_test_split(temp_df, test_size=0.5, random_state=42)
+
+# Save to CSV
+train_df.to_csv("train.csv", index=False)
+val_df.to_csv("validation.csv", index=False)
+test_df.to_csv("test.csv", index=False)
+
+print("Splitting done! Train:", len(train_df), "Val:", len(val_df), "Test:", len(test_df))
+
+
+class ChunkedBrainActivityDataset(Dataset):
+    def __init__(self, csv_file, base_dir, activity_mapping):
+        self.df = csv_file
+        self.base_dir = base_dir
+        self.activity_mapping = activity_mapping
+        self.resize_transform = transforms.Resize((224, 224))
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        spect_id, label, offset = self.df.iloc[idx][["spectrogram_id", "expert_consensus", "spectrogram_label_offset_seconds"]]
+
+        temp_df = pd.read_parquet(f'{self.base_dir}/train_spectrograms/{spect_id}.parquet')
+        temp_df.drop(['time'], axis=1, inplace=True)
+
+        start = int(offset) // 2
+        temp_df = temp_df[start:start+300]
+        temp_df = np.log1p(temp_df)
+        temp_df /= temp_df.max()
+        temp_arr = np.nan_to_num(temp_df.to_numpy(), nan=1e-4)
+
+        # Use OpenCV to apply a colormap and convert to RGB
+        temp_arr_uint8 = np.uint8(255 * temp_arr)
+        rgb_image = cv2.applyColorMap(temp_arr_uint8, cv2.COLORMAP_JET)
+
+        # Normalize to [0, 1] and convert to tensor
+        rgb_image = rgb_image.astype(np.float32) / 255.0
+        rgb_image_tensor = torch.tensor(rgb_image).permute(2, 0, 1)  # (C, H, W)
+        rgb_image_tensor = self.resize_transform(rgb_image_tensor)
+            
+        y = self.activity_mapping[label]
+        y_tensor = torch.nn.functional.one_hot(torch.tensor(y, dtype=torch.long), num_classes=6).float()
+        
+        return rgb_image_tensor, y_tensor
+
+
+# Now create DataLoader with the chunked dataset
+# chunk_size = 1000  # Adjust chunk size according to memory constraints
+
+train_dataset = ChunkedBrainActivityDataset(csv_file=train_df, base_dir=BASE_DIR, activity_mapping=activity_mapping)
+val_dataset = ChunkedBrainActivityDataset(csv_file=val_df, base_dir=BASE_DIR, activity_mapping=activity_mapping)
+test_dataset = ChunkedBrainActivityDataset(csv_file=test_df, base_dir=BASE_DIR, activity_mapping=activity_mapping)
+
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers= 2, pin_memory=True, prefetch_factor=2)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False, num_workers= 2, pin_memory=True, prefetch_factor=2)
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers= 2, pin_memory=True, prefetch_factor=2)
+
+
+# import torch
+# import torch.nn as nn
+# import torch.optim as optim
+# from torch.utils.data import DataLoader
+
+# # Assuming your ChunkedBrainActivityDataset class and the DataLoader code
+# # for train_loader, val_loader, and test_loader are already defined.
+
+# # Define a logistic regression model for multi-class classification.
+# class LogisticRegressionModel(nn.Module):
+#     def __init__(self, input_dim, num_classes):
+#         super(LogisticRegressionModel, self).__init__()
+#         self.linear = nn.Linear(input_dim, num_classes)
+        
+#     def forward(self, x):
+#         # Flatten the input tensor: (batch, 3, 224, 224) => (batch, 3*224*224)
+#         x = x.view(x.size(0), -1)
+#         # Return the raw logits (CrossEntropyLoss applies softmax internally)
+#         return self.linear(x)
+
+# # Set device to GPU if available
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# # Calculate the size of the flattened image.
+# # Your images are of shape: (3, 224, 224)
+# input_dim = 3 * 224 * 224
+# num_classes = 6
+
+# # Instantiate the model, loss function, and optimizer.
+# model = LogisticRegressionModel(input_dim, num_classes).to(device)
+
+# # CrossEntropyLoss expects integer labels, not one-hot vectors.
+# criterion = nn.CrossEntropyLoss()
+# optimizer = optim.SGD(model.parameters(), lr=0.01)
+
+# # Number of training epochs
+# num_epochs = 10
+
+# for epoch in range(num_epochs):
+#     model.train()
+#     running_loss = 0.0
+#     correct = 0
+#     total = 0
+#     for images, targets in train_loader:
+#         # Move the batch to the device
+#         images = images.to(device)
+#         targets = targets.to(device)
+#         # Convert one-hot targets to integer labels.
+#         labels = torch.argmax(targets, dim=1)
+
+#         optimizer.zero_grad()
+#         logits = model(images)
+#         loss = criterion(logits, labels)
+#         loss.backward()
+#         optimizer.step()
+
+#         running_loss += loss.item() * images.size(0)
+#         # Calculate accuracy for the batch
+#         _, preds = torch.max(logits, 1)
+#         total += labels.size(0)
+#         correct += (preds == labels).sum().item()
+        
+#     epoch_loss = running_loss / total
+#     epoch_acc = 100 * correct / total
+#     print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+
+
+# model.eval() # Set the model to evaluation mode
+# correct_test = 0
+# total_test = 0
+
+# with torch.no_grad(): # Disables gradient calculation
+#     for images, targets in test_loader:
+#         images = images.to(device)
+#         targets = targets.to(device)
+#         # Convert one-hot target vectors to scalar class labels
+#         labels = torch.argmax(targets, dim=1)
+#         # Forward pass to get predictions
+#         logits = model(images)
+#         _, preds = torch.max(logits, dim=1)
+#         total_test += labels.size(0)
+#         correct_test += (preds == labels).sum().item()
+#     test_accuracy = 100 * correct_test / total_test
+#     print(f"Test Accuracy: {test_accuracy:.2f}%")
+
+
+# import torch
+# import torch.nn as nn
+# import torch.optim as optim
+# import torchvision.models as models  # ✅ Correct import
+
+# # Define the model that uses EfficientNet as an encoder with logistic regression as the classifier
+# class EfficientNetV2EncoderLogisticRegression(nn.Module):
+#     def __init__(self, num_classes=6):
+#         super(EfficientNetV2EncoderLogisticRegression, self).__init__()
+#         # ✅ Load pretrained EfficientNetV2-S correctly
+#         self.encoder = models.efficientnet_v2_s(weights=models.EfficientNet_V2_S_Weights.DEFAULT)
+        
+#         # Get the feature size from the last layer
+#         n_features = self.encoder.classifier[1].in_features
+        
+#         # Remove the classifier head
+#         self.encoder.classifier = nn.Identity()
+        
+#         # Add a logistic regression layer for classification
+#         self.logistic_regression = nn.Linear(n_features, num_classes)
+
+#     def forward(self, x):
+#         features = self.encoder(x)  # Extract features
+#         logits = self.logistic_regression(features)  # Apply classifier
+#         return logits
+
+# # Set device
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# # Instantiate the model and move it to the appropriate device
+# num_classes = 6
+# model = EfficientNetV2EncoderLogisticRegression(num_classes=num_classes).to(device)
+
+# # Load pretrained model weights
+# pretrained_path = "/kaggle/input/cnn_efficientnet_v1/pytorch/default/1/HMS_model_v1_efficientnet_v2_s.pth"
+# pretrained_dict = torch.load(pretrained_path, map_location=device)
+
+# # Get model's current state dict
+# model_dict = model.state_dict()
+
+# # ✅ Load only matching layers (ignore classifier mismatch)
+# pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and v.shape == model_dict[k].shape}
+# model_dict.update(pretrained_dict)
+# model.load_state_dict(model_dict)
+
+# # ✅ Do NOT redefine classifier again (already done inside the model class)
+# # Move model to device
+# model.to(device)
+
+# print("Model loaded and classifier updated successfully!")
+
+# # Define the loss function and optimizer
+# criterion = nn.CrossEntropyLoss()
+# optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# # Training loop
+# num_epochs = 10
+# for epoch in range(num_epochs):
+#     model.train()
+#     running_loss = 0.0
+#     correct = 0
+#     total = 0
+#     for images, targets in train_loader:
+#         images = images.to(device)
+#         targets = targets.to(device)
+#         labels = torch.argmax(targets, dim=1)  # Convert one-hot encoded to class index
+        
+#         optimizer.zero_grad()
+#         logits = model(images)
+#         loss = criterion(logits, labels)
+#         loss.backward()
+#         optimizer.step()
+        
+#         running_loss += loss.item() * images.size(0)
+#         _, preds = torch.max(logits, dim=1)
+#         total += labels.size(0)
+#         correct += (preds == labels).sum().item()
+    
+#     epoch_loss = running_loss / total
+#     epoch_acc = 100 * correct / total
+#     print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+
+# # Evaluate on the test dataset
+# model.eval()
+# correct_test = 0
+# total_test = 0
+# with torch.no_grad():
+#     for images, targets in test_loader:
+#         images = images.to(device)
+#         targets = targets.to(device)
+#         labels = torch.argmax(targets, dim=1)
+#         logits = model(images)
+#         _, preds = torch.max(logits, dim=1)
+#         total_test += labels.size(0)
+#         correct_test += (preds == labels).sum().item()
+
+# test_accuracy = 100 * correct_test / total_test
+# print(f"Test Accuracy: {test_accuracy:.2f}%")
+
+
+
+# # Define the model that uses a custom CNN encoder
+# class RandomCNNEncoderLogisticRegression(nn.Module):
+#     def __init__(self, num_classes=6):
+#         super(RandomCNNEncoderLogisticRegression, self).__init__()
+#         # Define a simple CNN encoder
+#         self.encoder = nn.Sequential(
+#             nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1),  # (C, H, W) -> (64, H, W)
+#             nn.ReLU(),
+#             nn.MaxPool2d(kernel_size=2, stride=2),  # Downsample (64, H/2, W/2)
+#             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),  # (128, H/2, W/2)
+#             nn.ReLU(),
+#             nn.MaxPool2d(kernel_size=2, stride=2),  # Downsample (128, H/4, W/4)
+#             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),  # (256, H/4, W/4)
+#             nn.ReLU(),
+#             nn.AdaptiveAvgPool2d((1, 1))  # Global average pooling (256, 1, 1)
+#         )
+        
+#         # Logistic regression layer
+#         self.logistic_regression = nn.Linear(256, num_classes)
+
+#     def forward(self, x):
+#         features = self.encoder(x)  # Extract features
+#         features = features.view(features.size(0), -1)  # Flatten (B, 256)
+#         logits = self.logistic_regression(features)  # Apply classifier
+#         return logits
+
+# # Set device
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# # Instantiate the model
+# num_classes = 6
+# model = RandomCNNEncoderLogisticRegression(num_classes=num_classes).to(device)
+
+# # Define the loss function and optimizer
+# criterion = nn.CrossEntropyLoss()
+# optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# print("Model with random CNN encoder initialized successfully!")
+
+# # Training loop (same as before)
+# num_epochs = 10
+# for epoch in range(num_epochs):
+#     model.train()
+#     running_loss = 0.0
+#     correct = 0
+#     total = 0
+#     for images, targets in train_loader:
+#         images = images.to(device)
+#         targets = targets.to(device)
+#         labels = torch.argmax(targets, dim=1)  # Convert one-hot encoded to class index
+        
+#         optimizer.zero_grad()
+#         logits = model(images)
+#         loss = criterion(logits, labels)
+#         loss.backward()
+#         optimizer.step()
+        
+#         running_loss += loss.item() * images.size(0)
+#         _, preds = torch.max(logits, dim=1)
+#         total += labels.size(0)
+#         correct += (preds == labels).sum().item()
+    
+#     epoch_loss = running_loss / total
+#     epoch_acc = 100 * correct / total
+#     print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+
+# # Evaluate on the test dataset (same as before)
+# model.eval()
+# correct_test = 0
+# total_test = 0
+# with torch.no_grad():
+#     for images, targets in test_loader:
+#         images = images.to(device)
+#         targets = targets.to(device)
+#         labels = torch.argmax(targets, dim=1)
+#         logits = model(images)
+#         _, preds = torch.max(logits, dim=1)
+#         total_test += labels.size(0)
+#         correct_test += (preds == labels).sum().item()
+
+# test_accuracy = 100 * correct_test / total_test
+# print(f"Test Accuracy: {test_accuracy:.2f}%")
+
+
+
+import torch
+import torch.nn as nn
+import torchvision.models as models
+
+class SimCLR(nn.Module):
+    def __init__(self, base_model, projection_dim=128):
+        super(SimCLR, self).__init__()
+        self.encoder = base_model
+        self.encoder.fc = nn.Identity()  # Remove the final fully connected layer
+        
+        # Projection head
+        self.projection = nn.Sequential(
+            nn.Linear(2048, 2048),
+            nn.ReLU(),
+            nn.Linear(2048, projection_dim)
+        )
+    
+    def forward(self, x):
+        h = self.encoder(x)
+        z = self.projection(h)
+        return h, z
+
+class NTXentLoss(nn.Module):
+    def __init__(self, temperature=0.1):
+        super(NTXentLoss, self).__init__()
+        self.temperature = temperature
+    
+    def forward(self, out1, out2):
+        # Normalize the outputs
+        out1 = torch.nn.functional.normalize(out1, dim=1)
+        out2 = torch.nn.functional.normalize(out2, dim=1)
+        
+        # Compute similarity matrix
+        sim_matrix = torch.exp(torch.mm(out1, out2.T) / self.temperature)
+        
+        # Positive pairs are on the diagonal
+        pos_pairs = torch.diag(sim_matrix)
+        
+        # Negative pairs are all non-diagonal elements
+        neg_pairs = sim_matrix.sum(dim=1) - pos_pairs
+        
+        # Compute loss
+        loss = -torch.log(pos_pairs / neg_pairs).mean()
+        
+        return loss
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Instantiate the model and move it to the appropriate device
+base_model = models.resnet50(pretrained=False)
+model = SimCLR(base_model).to(device)
+
+# Define the loss function and optimizer
+criterion = NTXentLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+
+
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from torchvision.transforms.functional import to_pil_image
+
+class RandomAugmentation(nn.Module):
+    def __init__(self):
+        super(RandomAugmentation, self).__init__()
+        self.augmentations = transforms.Compose([
+            transforms.RandomResizedCrop(224),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomApply([transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2)], p=0.8),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    def forward(self, x):
+        print("RandomAugmentation forward called")
+        # Handle input batch of shape (N, C, H, W)
+        if len(x.shape) == 4:
+            print("Batch input detected")
+            return torch.stack([self.augmentations(to_pil_image(img)) for img in x])
+        # Handle single image of shape (C, H, W)
+        elif len(x.shape) == 3:
+            print("Single image input detected")
+            return self.augmentations(to_pil_image(x))
+        else:
+            raise ValueError(f"Invalid input shape {x.shape}. Expected (C, H, W) or (N, C, H, W).")
+
+# Create two instances of the augmentation pipeline
+aug1 = RandomAugmentation()
+aug2 = RandomAugmentation()
+
+# Training loop
+num_epochs = 10
+for epoch in range(num_epochs):
+    print(f"Starting epoch {epoch+1}/{num_epochs}")
+    model.train()
+    running_loss = 0.0
+    for batch_idx, (images, _) in enumerate(train_loader):
+        print(f"Processing batch {batch_idx+1}")
+        # Ensure images are on CPU before converting to PIL
+        images = images.cpu()
+        
+        print("Applying random augmentations (aug1)")
+        aug_images1 = aug1(images)  # Shape: (N, C, H, W)
+        
+        print("Applying random augmentations (aug2)")
+        aug_images2 = aug2(images)  # Shape: (N, C, H, W)
+        
+        aug_images1 = aug_images1.to(device)
+        aug_images2 = aug_images2.to(device)
+        
+        print("Forward pass through the model")
+        _, z1 = model(aug_images1)
+        _, z2 = model(aug_images2)
+        
+        print("Computing contrastive loss")
+        loss = criterion(z1, z2)
+        
+        print("Performing backpropagation")
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss.item() * images.size(0)
+    
+    epoch_loss = running_loss / len(train_loader.dataset)
+    print(f"Epoch [{epoch+1}/{num_epochs}] completed, Loss: {epoch_loss:.4f}")
+
+
+
+# Fine-tuning with logistic regression
+class FineTuneModel(nn.Module):
+    def __init__(self, encoder, num_classes=6):
+        super(FineTuneModel, self).__init__()
+        self.encoder = encoder
+        self.logistic_regression = nn.Linear(2048, num_classes)
+    
+    def forward(self, x):
+        h = self.encoder(x)
+        logits = self.logistic_regression(h)
+        return logits
+
+# Freeze the encoder and add a logistic regression layer
+fine_tune_model = FineTuneModel(model.encoder).to(device)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.Adam(fine_tune_model.logistic_regression.parameters(), lr=0.001)
+
+# Fine-tuning loop
+num_epochs = 5
+for epoch in range(num_epochs):
+    fine_tune_model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    for images, targets in train_loader:
+        images = images.to(device)
+        targets = targets.to(device)
+        labels = torch.argmax(targets, dim=1)  # Convert one-hot encoded to class index
+        
+        optimizer.zero_grad()
+        logits = fine_tune_model(images)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss.item() * images.size(0)
+        _, preds = torch.max(logits, dim=1)
+        total += labels.size(0)
+        correct += (preds == labels).sum().item()
+    
+    epoch_loss = running_loss / total
+    epoch_acc = 100 * correct / total
+    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+
+
+
+# Set the model to evaluation mode
+fine_tune_model.eval()
+
+# Initialize variables to track accuracy
+test_correct = 0
+test_total = 0
+
+# Disable gradient computation for evaluation
+with torch.no_grad():
+    for images, targets in test_loader:
+        images = images.to(device)
+        targets = targets.to(device)
+        labels = torch.argmax(targets, dim=1)  # Convert one-hot encoded to class index
+        
+        # Forward pass
+        logits = fine_tune_model(images)
+        
+        # Get predictions
+        _, preds = torch.max(logits, dim=1)
+        
+        # Update accuracy counters
+        test_total += labels.size(0)
+        test_correct += (preds == labels).sum().item()
+
+# Calculate test accuracy
+test_accuracy = 100 * test_correct / test_total
+
+print(f"Test Accuracy: {test_accuracy:.2f}%")
+
+
+
+
+

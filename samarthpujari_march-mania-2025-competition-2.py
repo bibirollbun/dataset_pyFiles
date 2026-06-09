@@ -1,0 +1,168 @@
+import numpy as np
+import pandas as pd
+from sklearn import *
+import glob
+
+path = '/kaggle/input/march-machine-learning-mania-2025/**'
+data = {p.split('/')[-1].split('.')[0] : pd.read_csv(p, encoding='latin-1') for p in glob.glob(path)}
+teams = pd.concat([data['MTeams'], data['WTeams']])
+teams_spelling = pd.concat([data['MTeamSpellings'], data['WTeamSpellings']])
+teams_spelling = teams_spelling.groupby(by='TeamID', as_index=False)['TeamNameSpelling'].count()
+teams_spelling.columns = ['TeamID', 'TeamNameCount']
+teams = pd.merge(teams, teams_spelling, how='left', on=['TeamID'])
+del teams_spelling
+
+season_cresults = pd.concat([data['MRegularSeasonCompactResults'], data['WRegularSeasonCompactResults']])
+season_dresults = pd.concat([data['MRegularSeasonDetailedResults'], data['WRegularSeasonDetailedResults']])
+tourney_cresults = pd.concat([data['MNCAATourneyCompactResults'], data['WNCAATourneyCompactResults']])
+tourney_dresults = pd.concat([data['MNCAATourneyDetailedResults'], data['WNCAATourneyDetailedResults']])
+slots = pd.concat([data['MNCAATourneySlots'], data['WNCAATourneySlots']])
+seeds = pd.concat([data['MNCAATourneySeeds'], data['WNCAATourneySeeds']])
+gcities = pd.concat([data['MGameCities'], data['WGameCities']])
+seasons = pd.concat([data['MSeasons'], data['WSeasons']])
+
+seeds = {'_'.join(map(str,[int(k1),k2])):int(v[1:3]) for k1, v, k2 in seeds[['Season', 'Seed', 'TeamID']].values}
+cities = data['Cities']
+sub = data['SampleSubmissionStage1']
+del data
+
+season_cresults['ST'] = 'S'
+season_dresults['ST'] = 'S'
+tourney_cresults['ST'] = 'T'
+tourney_dresults['ST'] = 'T'
+#games = pd.concat((season_cresults, tourney_cresults), axis=0, ignore_index=True)
+games = pd.concat((season_dresults, tourney_dresults), axis=0, ignore_index=True)
+games.reset_index(drop=True, inplace=True)
+games['WLoc'] = games['WLoc'].map({'A': 1, 'H': 2, 'N': 3})
+
+games['ID'] = games.apply(lambda r: '_'.join(map(str, [r['Season']]+sorted([r['WTeamID'],r['LTeamID']]))), axis=1)
+games['IDTeams'] = games.apply(lambda r: '_'.join(map(str, sorted([r['WTeamID'],r['LTeamID']]))), axis=1)
+games['Team1'] = games.apply(lambda r: sorted([r['WTeamID'],r['LTeamID']])[0], axis=1)
+games['Team2'] = games.apply(lambda r: sorted([r['WTeamID'],r['LTeamID']])[1], axis=1)
+games['IDTeam1'] = games.apply(lambda r: '_'.join(map(str, [r['Season'], r['Team1']])), axis=1)
+games['IDTeam2'] = games.apply(lambda r: '_'.join(map(str, [r['Season'], r['Team2']])), axis=1)
+
+games['Team1Seed'] = games['IDTeam1'].map(seeds).fillna(0)
+games['Team2Seed'] = games['IDTeam2'].map(seeds).fillna(0)
+
+games['ScoreDiff'] = games['WScore'] - games['LScore']
+games['Pred'] = games.apply(lambda r: 1. if sorted([r['WTeamID'],r['LTeamID']])[0]==r['WTeamID'] else 0., axis=1)
+games['ScoreDiffNorm'] = games.apply(lambda r: r['ScoreDiff'] * -1 if r['Pred'] == 0. else r['ScoreDiff'], axis=1)
+games['SeedDiff'] = games['Team1Seed'] - games['Team2Seed']
+games = games.fillna(-1)
+
+c_score_col = ['NumOT', 'WFGM', 'WFGA', 'WFGM3', 'WFGA3', 'WFTM', 'WFTA', 'WOR', 'WDR', 'WAst', 'WTO', 'WStl',
+ 'WBlk', 'WPF', 'LFGM', 'LFGA', 'LFGM3', 'LFGA3', 'LFTM', 'LFTA', 'LOR', 'LDR', 'LAst', 'LTO', 'LStl',
+ 'LBlk', 'LPF']
+c_score_agg = ['sum', 'mean', 'median', 'max', 'min', 'std', 'skew', 'nunique']
+gb = games.groupby(by=['IDTeams']).agg({k: c_score_agg for k in c_score_col}).reset_index()
+gb.columns = [''.join(c) + '_c_score' for c in gb.columns]
+
+games = games[games['ST']=='T']
+
+sub['WLoc'] = 3
+sub['Season'] = sub['ID'].map(lambda x: x.split('_')[0])
+sub['Season'] = sub['ID'].map(lambda x: x.split('_')[0])
+sub['Season'] = sub['Season'].astype(int)
+sub['Team1'] = sub['ID'].map(lambda x: x.split('_')[1])
+sub['Team2'] = sub['ID'].map(lambda x: x.split('_')[2])
+sub['IDTeams'] = sub.apply(lambda r: '_'.join(map(str, [r['Team1'], r['Team2']])), axis=1)
+sub['IDTeam1'] = sub.apply(lambda r: '_'.join(map(str, [r['Season'], r['Team1']])), axis=1)
+sub['IDTeam2'] = sub.apply(lambda r: '_'.join(map(str, [r['Season'], r['Team2']])), axis=1)
+sub['Team1Seed'] = sub['IDTeam1'].map(seeds).fillna(0)
+sub['Team2Seed'] = sub['IDTeam2'].map(seeds).fillna(0)
+sub['SeedDiff'] = sub['Team1Seed'] - sub['Team2Seed']
+sub = sub.fillna(-1)
+
+games = pd.merge(games, gb, how='left', left_on='IDTeams', right_on='IDTeams_c_score')
+sub = pd.merge(sub, gb, how='left', left_on='IDTeams', right_on='IDTeams_c_score')
+
+col = [c for c in games.columns if c not in ['ID', 'DayNum', 'ST', 'Team1', 'Team2', 'IDTeams', 'IDTeam1', 'IDTeam2', 'WTeamID', 'WScore', 'LTeamID', 'LScore', 'NumOT', 'Pred', 'ScoreDiff', 'ScoreDiffNorm', 'WLoc'] + c_score_col]
+
+
+from sklearn.model_selection import cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import log_loss, mean_absolute_error, brier_score_loss
+from sklearn.ensemble import ExtraTreesRegressor, VotingRegressor, RandomForestRegressor
+from catboost import CatBoostRegressor
+from sklearn.isotonic import IsotonicRegression 
+import optuna
+
+imputer = SimpleImputer(strategy='mean')
+scaler = StandardScaler()
+
+X = games[col].fillna(-1)
+X_imputed = imputer.fit_transform(X)
+X_scaled = scaler.fit_transform(X_imputed)
+
+sub_X = sub[col].fillna(-1)
+sub_X_imputed = imputer.transform(sub_X)
+sub_X_scaled = scaler.transform(sub_X_imputed)
+
+
+def objective(trial):
+    et_params = {
+        'et__n_estimators': trial.suggest_int('et__n_estimators', 200, 270),  # Reduced upper bound
+        'et__max_depth': trial.suggest_int('et__max_depth', 10, 20),  # Reduced max depth
+        'et__min_samples_split': trial.suggest_int('et__min_samples_split', 2, 5),  # Increased min samples
+        'et__max_features': trial.suggest_categorical('et__max_features', ['sqrt', 'log2']),  # Removed None option
+        'et__criterion': trial.suggest_categorical('et__criterion', ['squared_error', 'absolute_error']),
+        'et__n_jobs': -1,
+        'et__random_state': 42
+    }
+    rf_params = {
+        'rf__n_estimators': trial.suggest_int('rf__n_estimators',200, 270),  # Moderate number of trees
+        'rf__max_depth': trial.suggest_int('rf__max_depth', 10, 20),  # Limited depth
+        'rf__min_samples_split': trial.suggest_int('rf__min_samples_split', 2, 5),  # Higher min samples
+        'rf__max_features': trial.suggest_categorical('rf__max_features', ['sqrt', 'log2']),  # Restrict features
+        'rf__bootstrap': True,  # Enable bootstrapping
+        'rf__n_jobs': -1,
+        'rf__random_state': 42
+    }
+    rf_params = {k.replace('rf__', ''): v for k, v in rf_params.items() if k.startswith('rf__')}
+    et_params = {k.replace('et__', ''): v for k, v in et_params.items() if k.startswith('et__')}
+    et = ExtraTreesRegressor(**et_params)
+    rf = RandomForestRegressor(**rf_params)
+    voting_regressor = VotingRegressor(estimators=[('et', et), ('rf', rf)])
+    model = Pipeline(steps=[
+        ('voting', voting_regressor)
+    ])
+    model.fit(X_scaled, games['Pred'])
+    cv_scores = cross_val_score(model, X_scaled, games['Pred'] , cv=5, scoring="neg_mean_squared_error")
+    return -cv_scores.mean()
+
+# study = optuna.create_study(direction='minimize')
+# study.optimize(objective, n_trials=100)
+
+
+best_params = {'et__n_estimators': 253,
+ 'et__max_depth': 12,
+ 'et__min_samples_split': 3,
+ 'et__max_features': 'sqrt',
+ 'et__criterion': 'squared_error',
+ 'rf__n_estimators': 256,
+ 'rf__max_depth': 20,
+ 'rf__min_samples_split': 2,
+ 'rf__max_features': 'log2'}
+
+
+rf_best_params = {k.replace('rf__', ''): v for k, v in best_params.items() if k.startswith('rf__')}
+et_best_params = {k.replace('et__', ''): v for k, v in best_params.items() if k.startswith('et__')}
+et = ExtraTreesRegressor(**et_best_params)
+rf = RandomForestRegressor(**rf_best_params)
+voting_regressor = VotingRegressor(estimators=[('et', et), ('rf', rf)])
+pipe = Pipeline(steps=[
+        ('voting', voting_regressor)
+    ])
+pipe.fit(X_scaled, games['Pred'])
+pred = pipe.predict(sub_X_scaled).clip(0.001, 0.999)
+train_pred = pipe.predict(X_scaled).clip(0.001, 0.999)
+ir = IsotonicRegression(out_of_bounds='clip')
+ir.fit(train_pred, games['Pred'])
+sub['Pred'] = ir.transform(pred)
+
+sub[['ID', 'Pred']].to_csv('submission.csv', index=False)
+print(sub[['ID', 'Pred']].head())
+

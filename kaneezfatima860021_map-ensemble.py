@@ -1,0 +1,996 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
+VER=1
+#model_name = "google/gemma-2-9b-it"
+model_name = "/kaggle/input/gemma2-9b-it-cv945"
+EPOCHS = 2
+
+DIR = f"ver_{VER}"
+os.makedirs(DIR, exist_ok=True)
+
+
+import pandas as pd, numpy as np
+from sklearn.preprocessing import LabelEncoder
+
+le = LabelEncoder()
+train = pd.read_csv('/kaggle/input/map-charting-student-math-misunderstandings/train.csv')
+train.Misconception = train.Misconception.fillna('NA')
+train['target'] = train.Category+":"+train.Misconception
+train['label'] = le.fit_transform(train['target'])
+target_classes = le.classes_
+n_classes = len(target_classes)
+print(f"Train shape: {train.shape} with {n_classes} target classes")
+train.head()
+
+
+idx = train.apply(lambda row: row.Category.split('_')[0],axis=1)=='True'
+correct = train.loc[idx].copy()
+correct['c'] = correct.groupby(['QuestionId','MC_Answer']).MC_Answer.transform('count')
+correct = correct.sort_values('c',ascending=False)
+correct = correct.drop_duplicates(['QuestionId'])
+correct = correct[['QuestionId','MC_Answer']]
+correct['is_correct'] = 1
+
+train = train.merge(correct, on=['QuestionId','MC_Answer'], how='left')
+train.is_correct = train.is_correct.fillna(0)
+
+
+from IPython.display import display, Math, Latex
+
+# GET ANSWER CHOICES
+tmp = train.groupby(['QuestionId','MC_Answer']).size().reset_index(name='count')
+tmp['rank'] = tmp.groupby('QuestionId')['count'].rank(method='dense', ascending=False).astype(int) - 1
+tmp = tmp.drop('count',axis=1)
+tmp = tmp.sort_values(['QuestionId','rank'])
+
+# DISPLAY QUESTION AND ANSWER CHOICES
+Q = tmp.QuestionId.unique()
+for q in Q:
+    question = train.loc[train.QuestionId==q].iloc[0].QuestionText
+    choices = tmp.loc[tmp.QuestionId==q].MC_Answer.values
+    labels="ABCD"
+    choice_str = " ".join([f"({labels[i]}) {choice}" for i, choice in enumerate(choices)])
+    
+    print()
+    display(Latex(f"QuestionId {q}: {question}") )
+    display(Latex(f"MC Answers: {choice_str}"))
+
+
+import torch
+from transformers import AutoTokenizer
+from sklearn.model_selection import train_test_split
+from datasets import Dataset
+import numpy as np
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+MAX_LEN = 256
+
+
+def format_input(row):
+    x = "Yes"
+    if not row['is_correct']:
+        x = "No"
+    return (
+        f"Question: {row['QuestionText']}\n"
+        f"Answer: {row['MC_Answer']}\n"
+        f"Correct? {x}\n"
+        f"Student Explanation: {row['StudentExplanation']}"
+    )
+
+train['text'] = train.apply(format_input,axis=1)
+print("Example prompt for our LLM:")
+print()
+print( train.text.values[0] )
+
+
+lengths = [len(tokenizer.encode(t, truncation=False)) for t in train["text"]]
+import matplotlib.pyplot as plt
+
+plt.hist(lengths, bins=50)
+plt.title("Token Length Distribution")
+plt.xlabel("Number of tokens")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+
+
+L = (np.array(lengths)>MAX_LEN).sum()
+print(f"There are {L} train sample(s) with more than {MAX_LEN} tokens")
+np.sort( lengths )
+
+
+# Split into train and validation sets
+train_df, val_df = train_test_split(train, test_size=0.2, random_state=42)
+
+# Convert to Hugging Face Dataset
+COLS = ['text','label']
+train_ds = Dataset.from_pandas(train_df[COLS])
+val_ds = Dataset.from_pandas(val_df[COLS])
+
+
+# Tokenization function
+def tokenize(batch):
+    return tokenizer(batch["text"], padding="max_length", truncation=True, max_length=256)
+
+train_ds = train_ds.map(tokenize, batched=True)
+val_ds = val_ds.map(tokenize, batched=True)
+
+# Set format for PyTorch
+columns = ['input_ids', 'attention_mask', 'label']
+train_ds.set_format(type='torch', columns=columns)
+val_ds.set_format(type='torch', columns=columns)
+
+
+from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    "/kaggle/input/gemma2-9b-it-bf16",
+    num_labels=n_classes,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+
+
+from peft import PeftModel
+model = PeftModel.from_pretrained(model, model_name)
+
+
+training_args = TrainingArguments(
+    output_dir = f"./{DIR}",
+    do_train=True,
+    do_eval=True,
+    eval_strategy="steps",
+    save_strategy="steps", #no for no saving 
+    num_train_epochs=EPOCHS,
+    per_device_train_batch_size=8,
+    per_device_eval_batch_size=16,
+    learning_rate=2e-5,
+    logging_dir="./logs",
+    logging_steps=50,
+    save_steps=200,
+    eval_steps=200,
+    save_total_limit=1,
+    metric_for_best_model="map@3",
+    greater_is_better=True,
+    load_best_model_at_end=True,
+    report_to="none",
+    bf16=False, # TRAIN WITH BF16 IF LOCAL GPU IS NEWER GPU          
+    fp16=True, # INFER WITH FP16 BECAUSE KAGGLE IS T4 GPU
+)
+
+
+# CUSTOM MAP@3 METRIC
+
+from sklearn.metrics import average_precision_score
+
+def compute_map3(eval_pred):
+    logits, labels = eval_pred
+    probs = torch.nn.functional.softmax(torch.tensor(logits), dim=-1).numpy()
+    
+    top3 = np.argsort(-probs, axis=1)[:, :3]  # Top 3 predictions
+    match = (top3 == labels[:, None])
+
+    # Compute MAP@3 manually
+    map3 = 0
+    for i in range(len(labels)):
+        if match[i, 0]:
+            map3 += 1.0
+        elif match[i, 1]:
+            map3 += 1.0 / 2
+        elif match[i, 2]:
+            map3 += 1.0 / 3
+    return {"map@3": map3 / len(labels)}
+
+
+# Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    tokenizer=tokenizer,
+    compute_metrics=compute_map3,
+)
+
+#trainer.train()
+
+
+test = pd.read_csv('/kaggle/input/map-charting-student-math-misunderstandings/test.csv')
+print( test.shape )
+test.head()
+
+
+test = test.merge(correct, on=['QuestionId','MC_Answer'], how='left')
+test.is_correct = test.is_correct.fillna(0)
+
+test['text'] = test.apply(format_input,axis=1)
+
+test.head()
+
+
+ds_test = Dataset.from_pandas(test[['text']])
+ds_test = ds_test.map(tokenize, batched=True)
+
+predictions = trainer.predict(ds_test)
+probs = torch.nn.functional.softmax(torch.tensor(predictions.predictions), dim=1).numpy()
+
+
+# Get top 3 predicted class indices
+top3 = np.argsort(-probs, axis=1)[:, :]   # shape: [num_samples, 3]
+
+# Decode numeric class indices to original string labels
+flat_top3 = top3.flatten()
+decoded_labels = le.inverse_transform(flat_top3)
+top3_labels = decoded_labels.reshape(top3.shape)
+
+# Join 3 labels per row with space
+joined_preds = ["|".join(row) for row in top3_labels]
+
+# Save submission
+sub = pd.DataFrame({
+    "row_id": test.row_id.values,
+    "Category:Misconception": joined_preds
+})
+sub.to_csv("submission_gemma.csv", index=False)
+sub.head()
+
+
+sub.iloc[0]['Category:Misconception']
+
+
+
+import torch
+import gc
+
+del top3_labels, flat_top3, decoded_labels, top3, test, ds_test
+del training_args, train_ds, val_ds, model, trainer, predictions, probs
+# Delete any other lingering references
+for obj in list(globals().keys()):
+    if isinstance(globals()[obj], torch.nn.Module) or isinstance(globals()[obj], torch.Tensor):
+        del globals()[obj]
+
+
+torch.cuda.empty_cache()
+gc.collect()
+
+
+torch.cuda.ipc_collect()
+
+
+print("Memory allocated:", torch.cuda.memory_allocated())
+print("Memory reserved:", torch.cuda.memory_reserved())
+
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
+VER=1
+#model_name = "jhu-clsp/ettin-encoder-1b"
+model_name = "/kaggle/input/ettin-encoder-1b-cv943"
+EPOCHS = 3
+
+DIR = f"ver_{VER}"
+os.makedirs(DIR, exist_ok=True)
+
+
+
+import pandas as pd, numpy as np
+from sklearn.preprocessing import LabelEncoder
+
+le = LabelEncoder()
+train = pd.read_csv('/kaggle/input/map-charting-student-math-misunderstandings/train.csv')
+train.Misconception = train.Misconception.fillna('NA')
+train['target'] = train.Category+":"+train.Misconception
+train['label'] = le.fit_transform(train['target'])
+n_classes = len(le.classes_)
+print(f"Train shape: {train.shape} with {n_classes} target classes")
+train.head()
+
+
+idx = train.apply(lambda row: row.Category.split('_')[0],axis=1)=='True'
+correct = train.loc[idx].copy()
+correct['c'] = correct.groupby(['QuestionId','MC_Answer']).MC_Answer.transform('count')
+correct = correct.sort_values('c',ascending=False)
+correct = correct.drop_duplicates(['QuestionId'])
+correct = correct[['QuestionId','MC_Answer']]
+correct['is_correct'] = 1
+
+train = train.merge(correct, on=['QuestionId','MC_Answer'], how='left')
+train.is_correct = train.is_correct.fillna(0)
+
+
+from IPython.display import display, Math, Latex
+
+# GET ANSWER CHOICES
+tmp = train.groupby(['QuestionId','MC_Answer']).size().reset_index(name='count')
+tmp['rank'] = tmp.groupby('QuestionId')['count'].rank(method='dense', ascending=False).astype(int) - 1
+tmp = tmp.drop('count',axis=1)
+tmp = tmp.sort_values(['QuestionId','rank'])
+
+# DISPLAY QUESTION AND ANSWER CHOICES
+Q = tmp.QuestionId.unique()
+for q in Q:
+    question = train.loc[train.QuestionId==q].iloc[0].QuestionText
+    choices = tmp.loc[tmp.QuestionId==q].MC_Answer.values
+    labels="ABCD"
+    choice_str = " ".join([f"({labels[i]}) {choice}" for i, choice in enumerate(choices)])
+    
+    print()
+    display(Latex(f"QuestionId {q}: {question}") )
+    display(Latex(f"MC Answers: {choice_str}"))
+
+
+import torch
+from transformers import AutoTokenizer
+from sklearn.model_selection import train_test_split
+from datasets import Dataset
+import numpy as np
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+MAX_LEN = 256
+
+
+def format_input(row):
+    x = "Yes"
+    if not row['is_correct']:
+        x = "No"
+    return (
+        f"Question: {row['QuestionText']}\n"
+        f"Answer: {row['MC_Answer']}\n"
+        f"Correct? {x}\n"
+        f"Student Explanation: {row['StudentExplanation']}"
+    )
+
+train['text'] = train.apply(format_input,axis=1)
+print("Example prompt for our LLM:")
+print()
+print( train.text.values[0] )
+
+
+lengths = [len(tokenizer.encode(t, truncation=False)) for t in train["text"]]
+import matplotlib.pyplot as plt
+
+plt.hist(lengths, bins=50)
+plt.title("Token Length Distribution")
+plt.xlabel("Number of tokens")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+
+
+L = (np.array(lengths)>MAX_LEN).sum()
+print(f"There are {L} train sample(s) with more than {MAX_LEN} tokens")
+np.sort( lengths )
+
+
+# Split into train and validation sets
+train_df, val_df = train_test_split(train, test_size=0.2, random_state=42)
+
+# Convert to Hugging Face Dataset
+COLS = ['text','label']
+train_ds = Dataset.from_pandas(train_df[COLS])
+val_ds = Dataset.from_pandas(val_df[COLS])
+
+
+# Tokenization function
+def tokenize(batch):
+    return tokenizer(batch["text"], padding="max_length", truncation=True, max_length=256)
+
+train_ds = train_ds.map(tokenize, batched=True)
+val_ds = val_ds.map(tokenize, batched=True)
+
+# Set format for PyTorch
+columns = ['input_ids', 'attention_mask', 'label']
+train_ds.set_format(type='torch', columns=columns)
+val_ds.set_format(type='torch', columns=columns)
+
+
+from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=n_classes,
+    reference_compile=False,
+)
+
+
+training_args = TrainingArguments(
+    output_dir = f"./{DIR}",
+    do_train=True,
+    do_eval=True,
+    eval_strategy="steps",
+    save_strategy="steps", #no for no saving 
+    num_train_epochs=EPOCHS,
+    per_device_train_batch_size=16*2,
+    per_device_eval_batch_size=32*2,
+    learning_rate=5e-5,
+    logging_dir="./logs",
+    logging_steps=50,
+    save_steps=200,
+    eval_steps=200,
+    save_total_limit=1,
+    metric_for_best_model="map@3",
+    greater_is_better=True,
+    load_best_model_at_end=True,
+    report_to="none",
+    bf16=False, # TRAIN WITH BF16 IF LOCAL GPU IS NEWER GPU          
+    fp16=True, # INFER WITH FP16 BECAUSE KAGGLE IS T4 GPU
+)
+
+
+# CUSTOM MAP@3 METRIC
+
+from sklearn.metrics import average_precision_score
+
+def compute_map3(eval_pred):
+    logits, labels = eval_pred
+    probs = torch.nn.functional.softmax(torch.tensor(logits), dim=-1).numpy()
+    
+    top3 = np.argsort(-probs, axis=1)[:, :3]  # Top 3 predictions
+    match = (top3 == labels[:, None])
+
+    # Compute MAP@3 manually
+    map3 = 0
+    for i in range(len(labels)):
+        if match[i, 0]:
+            map3 += 1.0
+        elif match[i, 1]:
+            map3 += 1.0 / 2
+        elif match[i, 2]:
+            map3 += 1.0 / 3
+    return {"map@3": map3 / len(labels)}
+
+
+# Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    tokenizer=tokenizer,
+    compute_metrics=compute_map3,
+)
+
+#trainer.train()
+
+
+test = pd.read_csv('/kaggle/input/map-charting-student-math-misunderstandings/test.csv')
+print( test.shape )
+test.head()
+
+
+test = test.merge(correct, on=['QuestionId','MC_Answer'], how='left')
+test.is_correct = test.is_correct.fillna(0)
+
+test['text'] = test.apply(format_input,axis=1)
+
+test.head()
+
+
+ds_test = Dataset.from_pandas(test[['text']])
+ds_test = ds_test.map(tokenize, batched=True)
+
+predictions = trainer.predict(ds_test)
+probs = torch.nn.functional.softmax(torch.tensor(predictions.predictions), dim=1).numpy()
+
+
+# Get top 3 predicted class indices
+top3 = np.argsort(-probs, axis=1)[:, :]   # shape: [num_samples, 3]
+
+# Decode numeric class indices to original string labels
+flat_top3 = top3.flatten()
+decoded_labels = le.inverse_transform(flat_top3)
+top3_labels = decoded_labels.reshape(top3.shape)
+
+# Join 3 labels per row with space
+joined_preds = ["|".join(row) for row in top3_labels]
+
+# Save submission
+sub = pd.DataFrame({
+    "row_id": test.row_id.values,
+    "Category:Misconception": joined_preds
+})
+sub.to_csv("submission_ettin.csv", index=False)
+sub.head()
+
+
+sub.iloc[0]['Category:Misconception']
+
+
+
+for obj in list(globals().keys()):
+    if isinstance(globals()[obj], torch.nn.Module) or isinstance(globals()[obj], torch.Tensor):
+        del globals()[obj]
+
+
+torch.cuda.empty_cache()
+gc.collect()
+
+
+torch.cuda.ipc_collect()
+
+
+print("Memory allocated:", torch.cuda.memory_allocated())
+print("Memory reserved:", torch.cuda.memory_reserved())
+
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+
+VER=1
+#model_name = "answerdotai/ModernBERT-large"
+model_name = "/kaggle/input/modernbert-large-cv938"
+EPOCHS = 3
+
+DIR = f"ver_{VER}"
+os.makedirs(DIR, exist_ok=True)
+
+
+import pandas as pd, numpy as np
+from sklearn.preprocessing import LabelEncoder
+
+le = LabelEncoder()
+train = pd.read_csv('/kaggle/input/map-charting-student-math-misunderstandings/train.csv')
+train.Misconception = train.Misconception.fillna('NA')
+train['target'] = train.Category+":"+train.Misconception
+train['label'] = le.fit_transform(train['target'])
+n_classes = len(le.classes_)
+print(f"Train shape: {train.shape} with {n_classes} target classes")
+train.head()
+
+
+idx = train.apply(lambda row: row.Category.split('_')[0],axis=1)=='True'
+correct = train.loc[idx].copy()
+correct['c'] = correct.groupby(['QuestionId','MC_Answer']).MC_Answer.transform('count')
+correct = correct.sort_values('c',ascending=False)
+correct = correct.drop_duplicates(['QuestionId'])
+correct = correct[['QuestionId','MC_Answer']]
+correct['is_correct'] = 1
+
+train = train.merge(correct, on=['QuestionId','MC_Answer'], how='left')
+train.is_correct = train.is_correct.fillna(0)
+
+
+from IPython.display import display, Math, Latex
+
+# GET ANSWER CHOICES
+tmp = train.groupby(['QuestionId','MC_Answer']).size().reset_index(name='count')
+tmp['rank'] = tmp.groupby('QuestionId')['count'].rank(method='dense', ascending=False).astype(int) - 1
+tmp = tmp.drop('count',axis=1)
+tmp = tmp.sort_values(['QuestionId','rank'])
+
+# DISPLAY QUESTION AND ANSWER CHOICES
+Q = tmp.QuestionId.unique()
+for q in Q:
+    question = train.loc[train.QuestionId==q].iloc[0].QuestionText
+    choices = tmp.loc[tmp.QuestionId==q].MC_Answer.values
+    labels="ABCD"
+    choice_str = " ".join([f"({labels[i]}) {choice}" for i, choice in enumerate(choices)])
+    
+    print()
+    display(Latex(f"QuestionId {q}: {question}") )
+    display(Latex(f"MC Answers: {choice_str}"))
+
+
+import torch
+from transformers import AutoTokenizer
+from sklearn.model_selection import train_test_split
+from datasets import Dataset
+import numpy as np
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+MAX_LEN = 256
+
+
+def format_input(row):
+    x = "This answer is correct."
+    if not row['is_correct']:
+        x = "This is answer is incorrect."
+    return (
+        f"Question: {row['QuestionText']}\n"
+        f"Answer: {row['MC_Answer']}\n"
+        f"{x}\n"
+        f"Student Explanation: {row['StudentExplanation']}"
+    )
+
+train['text'] = train.apply(format_input,axis=1)
+print("Example prompt for our LLM:")
+print()
+print( train.text.values[0] )
+
+
+lengths = [len(tokenizer.encode(t, truncation=False)) for t in train["text"]]
+import matplotlib.pyplot as plt
+
+plt.hist(lengths, bins=50)
+plt.title("Token Length Distribution")
+plt.xlabel("Number of tokens")
+plt.ylabel("Frequency")
+plt.grid(True)
+plt.show()
+
+
+L = (np.array(lengths)>MAX_LEN).sum()
+print(f"There are {L} train sample(s) with more than {MAX_LEN} tokens")
+np.sort( lengths )
+
+
+# Split into train and validation sets
+train_df, val_df = train_test_split(train, test_size=0.2, random_state=42)
+
+# Convert to Hugging Face Dataset
+COLS = ['text','label']
+train_ds = Dataset.from_pandas(train_df[COLS])
+val_ds = Dataset.from_pandas(val_df[COLS])
+
+
+# Tokenization function
+def tokenize(batch):
+    return tokenizer(batch["text"], padding="max_length", truncation=True, max_length=256)
+
+train_ds = train_ds.map(tokenize, batched=True)
+val_ds = val_ds.map(tokenize, batched=True)
+
+# Set format for PyTorch
+columns = ['input_ids', 'attention_mask', 'label']
+train_ds.set_format(type='torch', columns=columns)
+val_ds.set_format(type='torch', columns=columns)
+
+
+from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=n_classes,
+    reference_compile=False,
+)
+
+
+training_args = TrainingArguments(
+    output_dir = f"./{DIR}",
+    do_train=True,
+    do_eval=True,
+    eval_strategy="steps",
+    save_strategy="steps", #no for no saving 
+    num_train_epochs=EPOCHS,
+    per_device_train_batch_size=16*2,
+    per_device_eval_batch_size=32*2,
+    learning_rate=5e-5,
+    logging_dir="./logs",
+    logging_steps=50,
+    save_steps=200,
+    eval_steps=200,
+    save_total_limit=1,
+    metric_for_best_model="map@3",
+    greater_is_better=True,
+    load_best_model_at_end=True,
+    report_to="none",
+    bf16=False, # TRAIN WITH BF16 IF LOCAL GPU IS NEWER GPU          
+    fp16=True, # INFER WITH FP16 BECAUSE KAGGLE IS T4 GPU
+)
+
+
+# CUSTOM MAP@3 METRIC
+
+from sklearn.metrics import average_precision_score
+
+def compute_map3(eval_pred):
+    logits, labels = eval_pred
+    probs = torch.nn.functional.softmax(torch.tensor(logits), dim=-1).numpy()
+    
+    top3 = np.argsort(-probs, axis=1)[:, :3]  # Top 3 predictions
+    match = (top3 == labels[:, None])
+
+    # Compute MAP@3 manually
+    map3 = 0
+    for i in range(len(labels)):
+        if match[i, 0]:
+            map3 += 1.0
+        elif match[i, 1]:
+            map3 += 1.0 / 2
+        elif match[i, 2]:
+            map3 += 1.0 / 3
+    return {"map@3": map3 / len(labels)}
+
+
+# Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    tokenizer=tokenizer,
+    compute_metrics=compute_map3,
+)
+
+#trainer.train()
+
+
+test = pd.read_csv('/kaggle/input/map-charting-student-math-misunderstandings/test.csv')
+print( test.shape )
+test.head()
+
+
+test = test.merge(correct, on=['QuestionId','MC_Answer'], how='left')
+test.is_correct = test.is_correct.fillna(0)
+
+test['text'] = test.apply(format_input,axis=1)
+
+test.head()
+
+
+ds_test = Dataset.from_pandas(test[['text']])
+ds_test = ds_test.map(tokenize, batched=True)
+
+predictions = trainer.predict(ds_test)
+probs = torch.nn.functional.softmax(torch.tensor(predictions.predictions), dim=1).numpy()
+
+
+
+# Get top 3 predicted class indices
+top3 = np.argsort(-probs, axis=1)[:, :]   # shape: [num_samples, 3]
+
+# Decode numeric class indices to original string labels
+flat_top3 = top3.flatten()
+decoded_labels = le.inverse_transform(flat_top3)
+top3_labels = decoded_labels.reshape(top3.shape)
+
+# Join 3 labels per row with space
+joined_preds = ["|".join(row) for row in top3_labels]
+
+# Save submission
+sub = pd.DataFrame({
+    "row_id": test.row_id.values,
+    "Category:Misconception": joined_preds
+})
+sub.to_csv("submission_modern.csv", index=False)
+sub.head()
+
+
+sub.iloc[0]['Category:Misconception']
+
+
+
+import torch
+import gc
+
+del top3_labels, flat_top3, decoded_labels, top3, test, ds_test
+del training_args, train_ds, val_ds, model, trainer, predictions, probs
+
+for obj in list(globals().keys()):
+    if isinstance(globals()[obj], torch.nn.Module) or isinstance(globals()[obj], torch.Tensor):
+        del globals()[obj]
+
+
+torch.cuda.empty_cache()
+gc.collect()
+
+
+torch.cuda.ipc_collect()
+
+print("Memory allocated:", torch.cuda.memory_allocated())
+print("Memory reserved:", torch.cuda.memory_reserved())
+
+
+
+import torch
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer, ModernBertForSequenceClassification, DataCollatorWithPadding
+from sklearn.model_selection import train_test_split
+from datasets import Dataset
+
+
+
+train = pd.read_csv('/kaggle/input/map-charting-student-math-misunderstandings/train.csv')
+test  = pd.read_csv('/kaggle/input/map-charting-student-math-misunderstandings/test.csv')
+
+
+from sklearn.preprocessing import LabelEncoder
+
+# Initialize label encoder
+le = LabelEncoder()
+
+# Fill missing misconceptions and create target string
+train['Misconception'] = train['Misconception'].fillna('NA')
+train['target'] = train['Category'] + ':' + train['Misconception']
+
+# Encode target labels
+train['label'] = le.fit_transform(train['target'])
+
+# Number of unique target classes
+n_classes = le.classes_.size
+print(f"Train shape: {train.shape} | Target classes: {n_classes}")
+
+
+
+# Identify rows where Category starts with 'True'
+idx = train['Category'].str.split('_').str[0] == 'True'
+
+# Subset and copy
+correct = train.loc[idx].copy()
+
+# Count occurrences for each (QuestionId, MC_Answer)
+correct['c'] = correct.groupby(['QuestionId', 'MC_Answer'])['MC_Answer'].transform('count')
+
+# Sort and drop duplicates by QuestionId
+correct = correct.sort_values('c', ascending=False)
+correct = correct.drop_duplicates(['QuestionId'])
+
+# Keep only required columns and mark correct answers
+correct = correct[['QuestionId', 'MC_Answer']]
+correct['is_correct'] = 1
+
+# Merge with train and fill missing as 0
+train = train.merge(correct, on=['QuestionId', 'MC_Answer'], how='left')
+train['is_correct'] = train['is_correct'].fillna(0)
+
+
+
+test = test.merge(correct, on=['QuestionId','MC_Answer'], how='left')
+test.is_correct = test.is_correct.fillna(0)
+
+
+
+def format_input(row):
+    x = "This answer is correct."
+    if not row['is_correct']:
+        x = "This is answer is incorrect."
+    return (
+        f"Question: {row['QuestionText']}\n"
+        f"Answer: {row['MC_Answer']}\n"
+        f"{x}\n"
+        f"Student Explanation: {row['StudentExplanation']}"
+    )
+
+test['text'] = test.apply(format_input,axis=1)
+
+
+ds_test = Dataset.from_pandas(test)
+model = AutoModelForSequenceClassification.from_pretrained("/kaggle/input/deekseepmath-7b-map-competition/MAP_EXP_09_FULL", device_map="cuda:0", torch_dtype=torch.bfloat16)
+
+
+
+tokenizer = AutoTokenizer.from_pretrained("/kaggle/input/deekseepmath-7b-map-competition/MAP_EXP_09_FULL")
+model.config.pad_token_id = tokenizer.pad_token_id
+
+def tokenize(batch):
+    return tokenizer(batch["text"], padding="max_length", truncation=True, max_length=256)
+
+ds_test = ds_test.map(tokenize, batched=True)
+
+
+# Define testing arguments
+test_args = TrainingArguments(
+    output_dir="./",
+    do_train=False,
+    do_predict=True,
+    per_device_eval_batch_size=16,  # Adjust if needed
+    bf16=False,                     # Use bf16 if GPU supports it
+    fp16=True,                      # Enable mixed precision
+    report_to="none"
+)
+
+# Initialize trainer
+trainer = Trainer(
+    model=model,
+    args=test_args,
+    tokenizer=tokenizer,
+    data_collator=DataCollatorWithPadding(tokenizer)
+)
+
+# Run predictions
+predictions = trainer.predict(ds_test)
+
+# Access raw predictions
+predictions.predictions
+
+
+
+# Get indices sorted by prediction score (descending)
+top3 = np.argsort(-predictions.predictions, axis=1)[:, :]
+
+# Flatten for label decoding
+flat_top3 = top3.ravel()
+
+# Decode label indices to original class names
+decoded_labels = le.inverse_transform(flat_top3)
+
+# Reshape back to match top3 structure
+top3_labels_cat = decoded_labels.reshape(top3.shape)
+top3_labels_cat
+
+
+
+joined_preds = []
+
+for preds in top3_labels_cat:
+    joined_preds.append("|".join(preds))
+
+
+
+# Save submission
+sub = pd.DataFrame({
+    "row_id": test.row_id.values,
+    "Category:Misconception": joined_preds
+})
+sub.to_csv("submission_deepseek.csv", index=False)
+sub.head()
+
+
+sub.iloc[0]['Category:Misconception']
+
+
+
+from collections import defaultdict
+
+def get_top_k_ensemble(l1, l2, l3, l4, k=3):
+    list1, list2, list3, list4 = l1.split('|'), l2.split('|'), l3.split('|'), l4.split('|')
+    weights = [4, 4, 4, 8]  
+    lists = [list1, list2, list3, list4]
+    score = defaultdict(int)
+
+    for i, lst in enumerate(lists):
+        weight = weights[i]
+        for rank, item in enumerate(lst):
+            score[item] += (len(lst) - rank) * weight
+
+
+    sorted_items = sorted(score.items(), key=lambda x: -x[1])
+    return ' '.join([item for item, _ in sorted_items[:k]])
+
+list1 = 'a|b|d|f'
+list2 = 'b|c|a|e'
+list3 = 'c|e|b'
+list4 = 'f|e'
+
+print(get_top_k_ensemble(list1, list2, list3, list4, k=3))
+
+
+df1 = pd.read_csv('submission_gemma.csv').rename(columns = {'Category:Misconception':'Category:Misconception_gemma'})
+df2 = pd.read_csv('submission_ettin.csv').rename(columns = {'Category:Misconception':'Category:Misconception_ettin'})
+df3 = pd.read_csv('submission_modern.csv').rename(columns = {'Category:Misconception':'Category:Misconception_modern'})
+df4 = pd.read_csv('submission_deepseek.csv').rename(columns = {'Category:Misconception':'Category:Misconception_deepseek'})
+
+
+df = pd.merge(df1, df2, on = 'row_id', how = 'inner')
+df = pd.merge(df, df3, on = 'row_id', how = 'inner')
+df = pd.merge(df, df4, on = 'row_id', how = 'inner')
+
+df['Category:Misconception'] = df.apply(lambda x: get_top_k_ensemble(x['Category:Misconception_gemma'], x['Category:Misconception_ettin'], x['Category:Misconception_modern'], x['Category:Misconception_deepseek']), axis = 1)
+df[['row_id', 'Category:Misconception']].to_csv('submission.csv', index = False)
+pd.read_csv('submission.csv')
+
+
+
+
+
+
+
+

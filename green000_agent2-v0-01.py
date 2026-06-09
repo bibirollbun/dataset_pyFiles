@@ -1,0 +1,3 @@
+# If you found this before the general open sourcing, good job! I'm hopefully releasing everything tomorrow...
+!pip install git+https://github.com/Green0-0/Agent2 --target=/kaggle/working
+

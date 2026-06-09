@@ -1,0 +1,35 @@
+from kaggle_s_featured_competitions import present_competitions_per_year
+present_competitions_per_year()
+
+
+from kaggle_s_featured_competitions import present_medal_allocation
+present_medal_allocation(comp_id=6818)
+
+
+from kaggle_s_featured_competitions import present_topic_upvotes_for_competition
+present_topic_upvotes_for_competition(comp_id=6818)
+
+
+from discussion_activity_in_competition import present_discussion_activity_overall
+present_discussion_activity_overall(comp_id=6818)
+
+
+from discussion_activity_in_competition import present_discussion_activity_by_week
+present_discussion_activity_by_week(comp_id=6818)
+
+
+from competition_discussion_in_year import present_competition_discussion_in_year
+present_competition_discussion_in_year(2014)
+
+
+present_competition_discussion_in_year(2024)
+
+
+from competition_discussion_over_time import present_discussion_stats_over_time
+from competition_discussion_over_time import present_discussion_share_over_time
+
+present_discussion_stats_over_time()
+
+
+present_discussion_share_over_time()
+

@@ -1,0 +1,345 @@
+import numpy as np # linear algebra
+import polars as pl # data processing, CSV file I/O (e.g. pd.read_csv)
+import polars.selectors as cs
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+SHORTCUT = False 
+
+
+train_df = pl.read_csv("/kaggle/input/playground-series-s5e5/train.csv")
+test_df = pl.read_csv("/kaggle/input/playground-series-s5e5/test.csv")
+sample_submission_df = pl.read_csv("/kaggle/input/playground-series-s5e5/sample_submission.csv")
+#half_a_cookie_sub_female = pl.read_csv("/kaggle/input/give-me-half-a-cookie/submission_1.csv")
+#half_a_cookie_sub_male = pl.read_csv("/kaggle/input/submission-male/submission_0 (2).csv")
+
+print (f"{train_df.shape = }, {test_df.shape = }")
+with pl.Config (tbl_cols = 20) :
+    print (train_df.head(20))
+
+
+display (train_df.select(cs.numeric()).describe())
+
+
+import seaborn as sns
+import matplotlib.pyplot as plt
+# Number of columns for the subplot grid
+num_cols = 2
+features = ["Age", "Height", "Weight", "Duration", "Heart_Rate", "Body_Temp"]
+
+
+# Calculate the number of rows needed for the subplots
+num_rows = (len(features) + num_cols - 1) // num_cols  # Ceiling division
+
+
+
+# Create the subplots
+fig, axes = plt.subplots(num_rows, num_cols, figsize=(12, 4 * num_rows))  # Adjust figsize as needed
+
+# Flatten the axes array to easily iterate over it
+axes = axes.flatten()
+
+# Iterate through the features and create histograms
+for i, feature in enumerate(features):
+    sns.histplot(data=train_df.to_pandas(), x=feature, ax=axes[i], kde=True, bins = 10)  # Added kde=True for density curve
+    axes[i].set_title(f"Distribution of {feature}")
+    axes[i].set_xlabel(feature)  # Ensure x-axis label is the feature name
+    axes[i].set_ylabel("Frequency")
+
+# Remove any unused subplots (if the number of features is not a multiple of num_cols)
+for i in range(len(features), len(axes)):
+    fig.delaxes(axes[i])
+
+# Adjust the layout to prevent overlapping titles/labels
+plt.tight_layout()
+
+# Show the plot
+plt.show()
+
+
+# Create the subplots
+fig, axes = plt.subplots(num_rows, num_cols, figsize=(12, 4 * num_rows))  # Adjust figsize as needed
+
+# Flatten the axes array to easily iterate over it
+axes = axes.flatten()
+
+
+# Iterate through the features and create histograms
+for i, feature in enumerate(features):
+    sns.histplot(data=test_df.to_pandas(), x=feature, ax=axes[i], kde=True, bins = 10)  # Added kde=True for density curve
+    axes[i].set_title(f"Distribution of {feature}")
+    axes[i].set_xlabel(feature)  # Ensure x-axis label is the feature name
+    axes[i].set_ylabel("Frequency")
+
+# Remove any unused subplots (if the number of features is not a multiple of num_cols)
+for i in range(len(features), len(axes)):
+    fig.delaxes(axes[i])
+
+# Adjust the layout to prevent overlapping titles/labels
+plt.tight_layout()
+
+# Show the plot
+plt.show()
+
+
+gender_map = {"male" : 0,
+              "female" : 1}
+
+train_df_mod = train_df.with_columns (pl.col("Sex").replace_strict (gender_map))
+
+train_df_mod = train_df_mod.drop("id")
+
+print (train_df_mod.head())
+
+print (sns.heatmap(train_df_mod.corr().to_pandas()))
+
+
+
+sns.scatterplot (data = train_df_mod.to_pandas(), x= "Duration", y = "Calories", hue = "Sex")
+
+
+sns.scatterplot (data = train_df_mod.to_pandas(), x= "Heart_Rate", y = "Calories", hue = "Sex")
+
+
+sns.scatterplot (data = train_df_mod.to_pandas(), x= "Body_Temp", y = "Calories", hue = "Sex")
+
+
+def remove_outliers (df : pl.DataFrame) -> pl.DataFrame :
+    return  df.filter (((pl.col("Calories") / pl.col("Duration") < 11) | (pl.col("Duration") > 22)) & 
+                        (pl.col("Calories") < 300))
+    
+
+
+from itertools import combinations
+
+
+def drop_duplicates (df : pl.DataFrame) -> pl.DataFrame :
+   features = df.columns 
+   features.remove("id")
+   return df.unique(subset = features) 
+    
+
+gender_map = {"male" : 0,
+              "female" : 1}
+
+def add_features (df : pl.DataFrame) -> pl.DataFrame :
+    result = df.with_columns (pl.col("Sex").replace_strict (gender_map),
+                              (pl.col("Weight") * pl.col("Weight")/pl.col("Height")).alias ("BMI"),
+                              (pl.col("Heart_Rate")/(220 - pl.col("Age"))).alias ("HR_zone"),
+                               (pl.col("Duration").cast(pl.String) + "_min").alias ("duration_cat"),
+                               (pl.col("Age").cast(pl.String) + "_cat").alias ("age_cat"),
+                               (pl.col("Body_Temp").cast(pl.String) + "_cat").alias ("Body_Temp_cat"),
+                             )
+    my_features = ["BMI", "HR_zone", "Weight", "Heart_Rate", "Duration", "Age", "Body_Temp"] 
+    feature_pairs = list(combinations(my_features, 2))
+    for feature_pair in feature_pairs :
+        a,b = feature_pair 
+        result = result.with_columns ((pl.col(a) * pl.col(b)).alias (f"{a}_mult_{b}"), 
+                                      (pl.col(a) / (0.001 + pl.col(b))).alias (f"{a}_div_{b}"), 
+                                      (pl.col(a) + pl.col(b)).alias (f"{a}_plus_{b}"), 
+                                      (pl.col(a) - pl.col(b)).alias (f"{a}_diff_{b}") )
+    if "Calories" in df.columns :
+        result = result.with_columns (pl.col("Calories").log1p().alias ("Calories_log"))
+        result = result.drop ("Calories")
+    return result         
+
+train_clean = train_df.pipe (
+#    remove_outliers).pipe (
+    drop_duplicates).pipe(
+                add_features )
+test_clean = test_df.pipe (add_features)
+
+print (train_clean.head())
+
+
+train_clean_male = train_clean.filter(pl.col("Sex") ==  0) 
+train_clean_female = train_clean.filter(pl.col("Sex") ==  1)
+test_clean_male = test_clean.filter(pl.col("Sex") ==  0)
+test_clean_female = test_clean.filter(pl.col("Sex") ==  1)
+
+
+!pip install ray==2.10.0
+!pip install scikit-learn==1.5.2
+!pip install autogluon.tabular --no-cache-dir -q
+# !pip install -U ipywidgets
+
+
+
+from autogluon.tabular import TabularPredictor
+
+predictor_male= TabularPredictor(path = '/kaggle/working/Autogluon/male',
+                                       label='Calories_log', 
+                               problem_type = 'regression', 
+                               eval_metric =  'root_mean_squared_error',  
+                               # sample_weight = 'my_weight',
+                               verbosity  = 3,
+                               learner_kwargs = {'ignored_columns' : [
+                                   'id',
+                                   'Sex'
+                               #    'Price'
+                               #   'my_weight'
+                                    ]})
+
+
+
+
+cat_male_optuna = {'depth': 10, 'l2_leaf_reg': 3.3037775140170704, 'learning_rate': 0.05463508754462207,  'ag_args': {'name_suffix': '_optuna_male', 'priority': -2}}
+custom_hyperparameters  = {
+	'NN_TORCH': [{}, {'activation': 'elu', 'dropout_prob': 0.10077639529843717, 'hidden_size': 108, 'learning_rate': 0.002735937344002146, 'num_layers': 4, 'use_batchnorm': True, 'weight_decay': 1.356433327634438e-12, 'ag_args': {'name_suffix': '_r79', 'priority': -2}}, {'activation': 'elu', 'dropout_prob': 0.11897478034205347, 'hidden_size': 213, 'learning_rate': 0.0010474382260641949, 'num_layers': 4, 'use_batchnorm': False, 'weight_decay': 5.594471067786272e-10, 'ag_args': {'name_suffix': '_r22', 'priority': -7}}, {'activation': 'elu', 'dropout_prob': 0.24622382571353768, 'hidden_size': 159, 'learning_rate': 0.008507536855608535, 'num_layers': 5, 'use_batchnorm': True, 'weight_decay': 1.8201539594953562e-06, 'ag_args': {'name_suffix': '_r30', 'priority': -17}}, {'activation': 'relu', 'dropout_prob': 0.09976801642258049, 'hidden_size': 135, 'learning_rate': 0.001631450730978947, 'num_layers': 5, 'use_batchnorm': False, 'weight_decay': 3.867683394425807e-05, 'ag_args': {'name_suffix': '_r86', 'priority': -19}}, {'activation': 'relu', 'dropout_prob': 0.3905837860053583, 'hidden_size': 106, 'learning_rate': 0.0018297905295930797, 'num_layers': 1, 'use_batchnorm': True, 'weight_decay': 9.178069874232892e-08, 'ag_args': {'name_suffix': '_r14', 'priority': -26}}, {'activation': 'relu', 'dropout_prob': 0.05488816803887784, 'hidden_size': 32, 'learning_rate': 0.0075612897834015985, 'num_layers': 4, 'use_batchnorm': True, 'weight_decay': 1.652353009917866e-08, 'ag_args': {'name_suffix': '_r41', 'priority': -35}}, {'activation': 'elu', 'dropout_prob': 0.01030258381183309, 'hidden_size': 111, 'learning_rate': 0.01845979186513771, 'num_layers': 5, 'use_batchnorm': True, 'weight_decay': 0.00020238017476912164, 'ag_args': {'name_suffix': '_r158', 'priority': -38}}, {'activation': 'elu', 'dropout_prob': 0.18109219857068798, 'hidden_size': 250, 'learning_rate': 0.00634181748507711, 'num_layers': 1, 'use_batchnorm': False, 'weight_decay': 5.3861175580695396e-08, 'ag_args': {'name_suffix': '_r197', 'priority': -41}}, {'activation': 'elu', 'dropout_prob': 0.1703783780377607, 'hidden_size': 212, 'learning_rate': 0.0004107199833213839, 'num_layers': 5, 'use_batchnorm': True, 'weight_decay': 1.105439140660822e-07, 'ag_args': {'name_suffix': '_r143', 'priority': -49}}, {'activation': 'elu', 'dropout_prob': 0.013288954106470907, 'hidden_size': 81, 'learning_rate': 0.005340914647396154, 'num_layers': 4, 'use_batchnorm': False, 'weight_decay': 8.762168370775353e-05, 'ag_args': {'name_suffix': '_r31', 'priority': -52}}, {'activation': 'relu', 'dropout_prob': 0.36669080773207274, 'hidden_size': 95, 'learning_rate': 0.015280159186761077, 'num_layers': 3, 'use_batchnorm': True, 'weight_decay': 1.3082489374636015e-08, 'ag_args': {'name_suffix': '_r87', 'priority': -59}}, {'activation': 'relu', 'dropout_prob': 0.3027114570947557, 'hidden_size': 196, 'learning_rate': 0.006482759295309238, 'num_layers': 1, 'use_batchnorm': False, 'weight_decay': 1.2806509958776e-12, 'ag_args': {'name_suffix': '_r71', 'priority': -60}}, {'activation': 'relu', 'dropout_prob': 0.12166942295569863, 'hidden_size': 151, 'learning_rate': 0.0018866871631794007, 'num_layers': 4, 'use_batchnorm': True, 'weight_decay': 9.190843763153802e-05, 'ag_args': {'name_suffix': '_r185', 'priority': -65}}, {'activation': 'relu', 'dropout_prob': 0.006531401073483156, 'hidden_size': 192, 'learning_rate': 0.012418052210914356, 'num_layers': 1, 'use_batchnorm': True, 'weight_decay': 3.0406866089493607e-05, 'ag_args': {'name_suffix': '_r76', 'priority': -77}}, {'activation': 'relu', 'dropout_prob': 0.33926015213879396, 'hidden_size': 247, 'learning_rate': 0.0029983839090226075, 'num_layers': 5, 'use_batchnorm': False, 'weight_decay': 0.00038926240517691234, 'ag_args': {'name_suffix': '_r121', 'priority': -79}}, {'activation': 'elu', 'dropout_prob': 0.06134755114373829, 'hidden_size': 144, 'learning_rate': 0.005834535148903801, 'num_layers': 5, 'use_batchnorm': True, 'weight_decay': 2.0826540090463355e-09, 'ag_args': {'name_suffix': '_r135', 'priority': -84}}, {'activation': 'elu', 'dropout_prob': 0.3457125770744979, 'hidden_size': 37, 'learning_rate': 0.006435774191713849, 'num_layers': 3, 'use_batchnorm': True, 'weight_decay': 2.4012185204155345e-08, 'ag_args': {'name_suffix': '_r36', 'priority': -87}}, {'activation': 'relu', 'dropout_prob': 0.2211285919550286, 'hidden_size': 196, 'learning_rate': 0.011307978270179143, 'num_layers': 1, 'use_batchnorm': True, 'weight_decay': 1.8441764217351068e-06, 'ag_args': {'name_suffix': '_r19', 'priority': -92}}, {'activation': 'relu', 'dropout_prob': 0.23713784729000734, 'hidden_size': 200, 'learning_rate': 0.00311256170909018, 'num_layers': 4, 'use_batchnorm': True, 'weight_decay': 4.573016756474468e-08, 'ag_args': {'name_suffix': '_r1', 'priority': -96}}, {'activation': 'relu', 'dropout_prob': 0.33567564890346097, 'hidden_size': 245, 'learning_rate': 0.006746560197328548, 'num_layers': 3, 'use_batchnorm': True, 'weight_decay': 1.6470047305392933e-10, 'ag_args': {'name_suffix': '_r89', 'priority': -97}}],
+	'GBM': [{'extra_trees': True, 'ag_args': {'name_suffix': 'XT'}}, {}, {'learning_rate': 0.03, 'num_leaves': 128, 'feature_fraction': 0.9, 'min_data_in_leaf': 3, 'ag_args': {'name_suffix': 'Large', 'priority': 0, 'hyperparameter_tune_kwargs': None}}, {'extra_trees': False, 'feature_fraction': 0.7023601671276614, 'learning_rate': 0.012144796373999013, 'min_data_in_leaf': 14, 'num_leaves': 53, 'ag_args': {'name_suffix': '_r131', 'priority': -3}}, {'extra_trees': True, 'feature_fraction': 0.5636931414546802, 'learning_rate': 0.01518660230385841, 'min_data_in_leaf': 48, 'num_leaves': 16, 'ag_args': {'name_suffix': '_r96', 'priority': -6}}, {'extra_trees': True, 'feature_fraction': 0.8282601210460099, 'learning_rate': 0.033929021353492905, 'min_data_in_leaf': 6, 'num_leaves': 127, 'ag_args': {'name_suffix': '_r188', 'priority': -14}}, {'extra_trees': False, 'feature_fraction': 0.6245777099925497, 'learning_rate': 0.04711573688184715, 'min_data_in_leaf': 56, 'num_leaves': 89, 'ag_args': {'name_suffix': '_r130', 'priority': -18}}, {'extra_trees': False, 'feature_fraction': 0.5898927512279213, 'learning_rate': 0.010464516487486093, 'min_data_in_leaf': 11, 'num_leaves': 252, 'ag_args': {'name_suffix': '_r161', 'priority': -27}}, {'extra_trees': True, 'feature_fraction': 0.5143401489640409, 'learning_rate': 0.00529479887023554, 'min_data_in_leaf': 6, 'num_leaves': 133, 'ag_args': {'name_suffix': '_r196', 'priority': -31}}, {'extra_trees': False, 'feature_fraction': 0.7421180622507277, 'learning_rate': 0.018603888565740096, 'min_data_in_leaf': 6, 'num_leaves': 22, 'ag_args': {'name_suffix': '_r15', 'priority': -37}}, {'extra_trees': False, 'feature_fraction': 0.9408897917880529, 'learning_rate': 0.01343464462043561, 'min_data_in_leaf': 21, 'num_leaves': 178, 'ag_args': {'name_suffix': '_r143', 'priority': -44}}, {'extra_trees': True, 'feature_fraction': 0.4341088458599442, 'learning_rate': 0.04034449862560467, 'min_data_in_leaf': 33, 'num_leaves': 16, 'ag_args': {'name_suffix': '_r94', 'priority': -48}}, {'extra_trees': True, 'feature_fraction': 0.9773131270704629, 'learning_rate': 0.010534290864227067, 'min_data_in_leaf': 21, 'num_leaves': 111, 'ag_args': {'name_suffix': '_r30', 'priority': -56}}, {'extra_trees': False, 'feature_fraction': 0.8254432681390782, 'learning_rate': 0.031251656439648626, 'min_data_in_leaf': 50, 'num_leaves': 210, 'ag_args': {'name_suffix': '_r135', 'priority': -69}}, {'extra_trees': False, 'feature_fraction': 0.5730390983988963, 'learning_rate': 0.010305352949119608, 'min_data_in_leaf': 10, 'num_leaves': 215, 'ag_args': {'name_suffix': '_r121', 'priority': -74}}, {'extra_trees': True, 'feature_fraction': 0.4601361323873807, 'learning_rate': 0.07856777698860955, 'min_data_in_leaf': 12, 'num_leaves': 198, 'ag_args': {'name_suffix': '_r42', 'priority': -95}}],
+	'CAT': [{},   {'depth': 6, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 2.1542798306067823, 'learning_rate': 0.06864209415792857, 'max_ctr_complexity': 4, 'one_hot_max_size': 10, 'ag_args': {'name_suffix': '_r177', 'priority': -1}}, {'depth': 8, 'grow_policy': 'Depthwise', 'l2_leaf_reg': 2.7997999596449104, 'learning_rate': 0.031375015734637225, 'max_ctr_complexity': 2, 'one_hot_max_size': 3, 'ag_args': {'name_suffix': '_r9', 'priority': -5}}, {'depth': 4, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 4.559174625782161, 'learning_rate': 0.04939557741379516, 'max_ctr_complexity': 3, 'one_hot_max_size': 3, 'ag_args': {'name_suffix': '_r137', 'priority': -10}}, {'depth': 8, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 3.3274013177541373, 'learning_rate': 0.017301189655111057, 'max_ctr_complexity': 5, 'one_hot_max_size': 10, 'ag_args': {'name_suffix': '_r13', 'priority': -12}}, {'depth': 4, 'grow_policy': 'Depthwise', 'l2_leaf_reg': 2.7018061518087038, 'learning_rate': 0.07092851311746352, 'max_ctr_complexity': 1, 'one_hot_max_size': 2, 'ag_args': {'name_suffix': '_r50', 'priority': -20}}, {'depth': 5, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 1.0457098345001241, 'learning_rate': 0.050294288910022224, 'max_ctr_complexity': 5, 'one_hot_max_size': 2, 'ag_args': {'name_suffix': '_r69', 'priority': -24}}, {'depth': 6, 'grow_policy': 'Depthwise', 'l2_leaf_reg': 1.3584121369544215, 'learning_rate': 0.03743901034980473, 'max_ctr_complexity': 3, 'one_hot_max_size': 2, 'ag_args': {'name_suffix': '_r70', 'priority': -29}}, {'depth': 7, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 4.522712492188319, 'learning_rate': 0.08481607830570326, 'max_ctr_complexity': 3, 'one_hot_max_size': 2, 'ag_args': {'name_suffix': '_r167', 'priority': -33}}, {'depth': 8, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 1.6376578537958237, 'learning_rate': 0.032899230324940465, 'max_ctr_complexity': 3, 'one_hot_max_size': 2, 'ag_args': {'name_suffix': '_r86', 'priority': -39}}, {'depth': 4, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 3.353268454214423, 'learning_rate': 0.06028218319511302, 'max_ctr_complexity': 1, 'one_hot_max_size': 10, 'ag_args': {'name_suffix': '_r49', 'priority': -42}}, {'depth': 8, 'grow_policy': 'Depthwise', 'l2_leaf_reg': 1.640921865280573, 'learning_rate': 0.036232951900213306, 'max_ctr_complexity': 3, 'one_hot_max_size': 5, 'ag_args': {'name_suffix': '_r128', 'priority': -50}}, {'depth': 4, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 2.894432181094842, 'learning_rate': 0.055078095725390575, 'max_ctr_complexity': 4, 'one_hot_max_size': 10, 'ag_args': {'name_suffix': '_r5', 'priority': -58}}, {'depth': 7, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 1.6761016245166451, 'learning_rate': 0.06566144806528762, 'max_ctr_complexity': 2, 'one_hot_max_size': 10, 'ag_args': {'name_suffix': '_r143', 'priority': -61}}, {'depth': 5, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 3.3217885487525205, 'learning_rate': 0.05291587380674719, 'max_ctr_complexity': 5, 'one_hot_max_size': 3, 'ag_args': {'name_suffix': '_r60', 'priority': -67}}, {'depth': 4, 'grow_policy': 'Depthwise', 'l2_leaf_reg': 1.5734131496361856, 'learning_rate': 0.08472519974533015, 'max_ctr_complexity': 3, 'one_hot_max_size': 2, 'ag_args': {'name_suffix': '_r6', 'priority': -72}}, {'depth': 7, 'grow_policy': 'Depthwise', 'l2_leaf_reg': 4.43335055453705, 'learning_rate': 0.055406199833457785, 'max_ctr_complexity': 5, 'one_hot_max_size': 10, 'ag_args': {'name_suffix': '_r180', 'priority': -76}}, {'depth': 7, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 4.835797074498082, 'learning_rate': 0.03534026385152556, 'max_ctr_complexity': 5, 'one_hot_max_size': 10, 'ag_args': {'name_suffix': '_r12', 'priority': -83}}, {'depth': 5, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 3.7454481983750014, 'learning_rate': 0.09328642499990342, 'max_ctr_complexity': 1, 'one_hot_max_size': 2, 'ag_args': {'name_suffix': '_r163', 'priority': -89}}, {'depth': 6, 'grow_policy': 'SymmetricTree', 'l2_leaf_reg': 3.637071465711953, 'learning_rate': 0.04387418552563314, 'max_ctr_complexity': 4, 'one_hot_max_size': 5, 'ag_args': {'name_suffix': '_r198', 'priority': -90}}],
+	'XGB': [{}, {'colsample_bytree': 0.6917311125174739, 'enable_categorical': False, 'learning_rate': 0.018063876087523967, 'max_depth': 10, 'min_child_weight': 0.6028633586934382, 'ag_args': {'name_suffix': '_r33', 'priority': -8}}, {'colsample_bytree': 0.6628423832084077, 'enable_categorical': False, 'learning_rate': 0.08775715546881824, 'max_depth': 5, 'min_child_weight': 0.6294123374222513, 'ag_args': {'name_suffix': '_r89', 'priority': -16}}, {'colsample_bytree': 0.9090166528779192, 'enable_categorical': True, 'learning_rate': 0.09290221350439203, 'max_depth': 7, 'min_child_weight': 0.8041986915994078, 'ag_args': {'name_suffix': '_r194', 'priority': -22}}, {'colsample_bytree': 0.516652313273348, 'enable_categorical': True, 'learning_rate': 0.007158072983547058, 'max_depth': 9, 'min_child_weight': 0.8567068904025429, 'ag_args': {'name_suffix': '_r98', 'priority': -36}}, {'colsample_bytree': 0.7452294043087835, 'enable_categorical': False, 'learning_rate': 0.038404229910104046, 'max_depth': 7, 'min_child_weight': 0.5564183327139662, 'ag_args': {'name_suffix': '_r49', 'priority': -57}}, {'colsample_bytree': 0.7506621909633511, 'enable_categorical': False, 'learning_rate': 0.009974712407899168, 'max_depth': 4, 'min_child_weight': 0.9238550485581797, 'ag_args': {'name_suffix': '_r31', 'priority': -64}}, {'colsample_bytree': 0.6326947454697227, 'enable_categorical': False, 'learning_rate': 0.07792091886639502, 'max_depth': 6, 'min_child_weight': 1.0759464955561793, 'ag_args': {'name_suffix': '_r22', 'priority': -70}}, {'colsample_bytree': 0.975937238416368, 'enable_categorical': False, 'learning_rate': 0.06634196266155237, 'max_depth': 5, 'min_child_weight': 1.4088437184127383, 'ag_args': {'name_suffix': '_r95', 'priority': -93}}, {'colsample_bytree': 0.546186944730449, 'enable_categorical': False, 'learning_rate': 0.029357102578825213, 'max_depth': 10, 'min_child_weight': 1.1532008198571337, 'ag_args': {'name_suffix': '_r34', 'priority': -94}}],
+	'FASTAI': [{}, {'bs': 256, 'emb_drop': 0.5411770367537934, 'epochs': 43, 'layers': [800, 400], 'lr': 0.01519848858318159, 'ps': 0.23782946566604385, 'ag_args': {'name_suffix': '_r191', 'priority': -4}}, {'bs': 2048, 'emb_drop': 0.05070411322605811, 'epochs': 29, 'layers': [200, 100], 'lr': 0.08974235041576624, 'ps': 0.10393466140748028, 'ag_args': {'name_suffix': '_r102', 'priority': -11}}, {'bs': 128, 'emb_drop': 0.44339037504795686, 'epochs': 31, 'layers': [400, 200, 100], 'lr': 0.008615195908919904, 'ps': 0.19220253419114286, 'ag_args': {'name_suffix': '_r145', 'priority': -15}}, {'bs': 128, 'emb_drop': 0.026897798530914306, 'epochs': 31, 'layers': [800, 400], 'lr': 0.08045277634470181, 'ps': 0.4569532219038436, 'ag_args': {'name_suffix': '_r11', 'priority': -21}}, {'bs': 256, 'emb_drop': 0.1508701680951814, 'epochs': 46, 'layers': [400, 200], 'lr': 0.08794353125787312, 'ps': 0.19110623090573325, 'ag_args': {'name_suffix': '_r103', 'priority': -25}}, {'bs': 1024, 'emb_drop': 0.6239200452002372, 'epochs': 39, 'layers': [200, 100, 50], 'lr': 0.07170321592506483, 'ps': 0.670815151683455, 'ag_args': {'name_suffix': '_r143', 'priority': -28}}, {'bs': 2048, 'emb_drop': 0.5055288166864152, 'epochs': 44, 'layers': [400], 'lr': 0.0047762208542912405, 'ps': 0.06572612802222005, 'ag_args': {'name_suffix': '_r156', 'priority': -30}}, {'bs': 128, 'emb_drop': 0.6656668277387758, 'epochs': 32, 'layers': [400, 200, 100], 'lr': 0.019326244622675428, 'ps': 0.04084945128641206, 'ag_args': {'name_suffix': '_r95', 'priority': -34}}, {'bs': 512, 'emb_drop': 0.1567472816422661, 'epochs': 41, 'layers': [400, 200, 100], 'lr': 0.06831450078222204, 'ps': 0.4930900813464729, 'ag_args': {'name_suffix': '_r37', 'priority': -40}}, {'bs': 2048, 'emb_drop': 0.006251885504130949, 'epochs': 47, 'layers': [800, 400], 'lr': 0.01329622020483052, 'ps': 0.2677080696008348, 'ag_args': {'name_suffix': '_r134', 'priority': -46}}, {'bs': 2048, 'emb_drop': 0.6343202884164582, 'epochs': 21, 'layers': [400, 200], 'lr': 0.08479209380262258, 'ps': 0.48362560779595565, 'ag_args': {'name_suffix': '_r111', 'priority': -51}}, {'bs': 1024, 'emb_drop': 0.22771721361129746, 'epochs': 38, 'layers': [400], 'lr': 0.0005383511954451698, 'ps': 0.3734259772256502, 'ag_args': {'name_suffix': '_r65', 'priority': -54}}, {'bs': 1024, 'emb_drop': 0.4329361816589235, 'epochs': 50, 'layers': [400], 'lr': 0.09501311551121323, 'ps': 0.2863378667611431, 'ag_args': {'name_suffix': '_r88', 'priority': -55}}, {'bs': 128, 'emb_drop': 0.3171659718142149, 'epochs': 20, 'layers': [400, 200, 100], 'lr': 0.03087210106068273, 'ps': 0.5909644730871169, 'ag_args': {'name_suffix': '_r160', 'priority': -66}}, {'bs': 128, 'emb_drop': 0.3209601865656554, 'epochs': 21, 'layers': [200, 100, 50], 'lr': 0.019935403046870463, 'ps': 0.19846319260751663, 'ag_args': {'name_suffix': '_r69', 'priority': -71}}, {'bs': 128, 'emb_drop': 0.08669109226243704, 'epochs': 45, 'layers': [800, 400], 'lr': 0.0041554361714983635, 'ps': 0.2669780074016213, 'ag_args': {'name_suffix': '_r138', 'priority': -73}}, {'bs': 512, 'emb_drop': 0.05604276533830355, 'epochs': 32, 'layers': [400], 'lr': 0.027320709383189166, 'ps': 0.022591301744255762, 'ag_args': {'name_suffix': '_r172', 'priority': -75}}, {'bs': 1024, 'emb_drop': 0.31956392388385874, 'epochs': 25, 'layers': [200, 100], 'lr': 0.08552736732040143, 'ps': 0.0934076022219228, 'ag_args': {'name_suffix': '_r127', 'priority': -80}}, {'bs': 256, 'emb_drop': 0.5117456464220826, 'epochs': 21, 'layers': [400, 200, 100], 'lr': 0.007212882302137526, 'ps': 0.2747013981281539, 'ag_args': {'name_suffix': '_r194', 'priority': -82}}, {'bs': 256, 'emb_drop': 0.06099050979107849, 'epochs': 39, 'layers': [200], 'lr': 0.04119582873110387, 'ps': 0.5447097256648953, 'ag_args': {'name_suffix': '_r4', 'priority': -85}}, {'bs': 2048, 'emb_drop': 0.6960805527533755, 'epochs': 38, 'layers': [800, 400], 'lr': 0.0007278526871749883, 'ps': 0.20495582200836318, 'ag_args': {'name_suffix': '_r100', 'priority': -88}}, {'bs': 1024, 'emb_drop': 0.5074958658302495, 'epochs': 42, 'layers': [200, 100, 50], 'lr': 0.026342427824862867, 'ps': 0.34814978753283593, 'ag_args': {'name_suffix': '_r187', 'priority': -91}}],
+	'RF': [{'criterion': 'gini', 'ag_args': {'name_suffix': 'Gini', 'problem_types': ['binary', 'multiclass']}}, {'criterion': 'entropy', 'ag_args': {'name_suffix': 'Entr', 'problem_types': ['binary', 'multiclass']}}, {'criterion': 'squared_error', 'ag_args': {'name_suffix': 'MSE', 'problem_types': ['regression', 'quantile']}}, {'max_features': 0.75, 'max_leaf_nodes': 37308, 'min_samples_leaf': 1, 'ag_args': {'name_suffix': '_r195', 'priority': -13}}, {'max_features': 0.75, 'max_leaf_nodes': 28310, 'min_samples_leaf': 2, 'ag_args': {'name_suffix': '_r39', 'priority': -32}}, {'max_features': 1.0, 'max_leaf_nodes': 38572, 'min_samples_leaf': 5, 'ag_args': {'name_suffix': '_r127', 'priority': -45}}, {'max_features': 0.75, 'max_leaf_nodes': 18242, 'min_samples_leaf': 40, 'ag_args': {'name_suffix': '_r34', 'priority': -47}}, {'max_features': 'log2', 'max_leaf_nodes': 42644, 'min_samples_leaf': 1, 'ag_args': {'name_suffix': '_r166', 'priority': -63}}, {'max_features': 0.75, 'max_leaf_nodes': 36230, 'min_samples_leaf': 3, 'ag_args': {'name_suffix': '_r15', 'priority': -68}}, {'max_features': 1.0, 'max_leaf_nodes': 48136, 'min_samples_leaf': 1, 'ag_args': {'name_suffix': '_r16', 'priority': -81}}],
+	'XT': [{'criterion': 'gini', 'ag_args': {'name_suffix': 'Gini', 'problem_types': ['binary', 'multiclass']}}, {'criterion': 'entropy', 'ag_args': {'name_suffix': 'Entr', 'problem_types': ['binary', 'multiclass']}}, {'criterion': 'squared_error', 'ag_args': {'name_suffix': 'MSE', 'problem_types': ['regression', 'quantile']}}, {'max_features': 0.75, 'max_leaf_nodes': 18392, 'min_samples_leaf': 1, 'ag_args': {'name_suffix': '_r42', 'priority': -9}}, {'max_features': 1.0, 'max_leaf_nodes': 12845, 'min_samples_leaf': 4, 'ag_args': {'name_suffix': '_r172', 'priority': -23}}, {'max_features': 'sqrt', 'max_leaf_nodes': 28532, 'min_samples_leaf': 1, 'ag_args': {'name_suffix': '_r49', 'priority': -43}}, {'max_features': 1.0, 'max_leaf_nodes': 19935, 'min_samples_leaf': 20, 'ag_args': {'name_suffix': '_r4', 'priority': -53}}, {'max_features': 0.75, 'max_leaf_nodes': 29813, 'min_samples_leaf': 4, 'ag_args': {'name_suffix': '_r178', 'priority': -62}}, {'max_features': 1.0, 'max_leaf_nodes': 40459, 'min_samples_leaf': 1, 'ag_args': {'name_suffix': '_r197', 'priority': -78}}, {'max_features': 'sqrt', 'max_leaf_nodes': 29702, 'min_samples_leaf': 2, 'ag_args': {'name_suffix': '_r126', 'priority': -86}}],
+	'KNN': [{'weights': 'uniform', 'ag_args': {'name_suffix': 'Unif'}}, {'weights': 'distance', 'ag_args': {'name_suffix': 'Dist'}}],
+}
+
+
+custom_hyperparameters['CAT'].append (cat_male_optuna)
+
+
+
+
+predictor_male.fit(train_data= train_clean_male.to_pandas(), 
+                        presets= 'experimental_quality',
+    # best_quality, high_quality, medium_quality, 'experimental_quality',                         
+                        time_limit = 18600,
+                        # num_gpus=1,
+ #                        raise_on_no_models_fitted = True,
+                        dynamic_stacking=False, 
+                        num_stack_levels=1,
+                        hyperparameters=custom_hyperparameters,
+#                         hyperparameters = my_search_hyperparameters  ,
+#                         hyperparameter_tune_kwargs=hyperparameter_tune_kwargs,
+                        )
+
+# predictor_male = TabularPredictor.load("/kaggle/working/Autogluon/male")
+
+
+display (predictor_male.leaderboard())
+
+
+fit_parameters_male = predictor_male.fit_summary(verbosity = 3, show_plot = True)
+display (fit_parameters_male)
+
+
+predictor_female= TabularPredictor(path = '/kaggle/working/Autogluon/female',
+                                       label='Calories_log', 
+                                problem_type = 'regression', 
+                               eval_metric =  'root_mean_squared_error',  
+                               # sample_weight = 'my_weight',
+                               verbosity  = 2,
+                               learner_kwargs = {'ignored_columns' : [
+                                   'id',
+                                   'Sex', 
+                               #    'Price'
+                               #   'my_weight'
+                                    ]})
+
+
+cat_optuna_female =  {'iterations': 590, 
+                      'learning_rate': 0.062494080576048446, 
+                      'depth': 9, 'l2_leaf_reg': 2.28306978679542, 
+                     'ag_args': {'name_suffix': '_optuna_female', 'priority': -3}}
+custom_hyperparameters['CAT'].append (cat_optuna_female)
+
+
+predictor_female.fit(train_data= train_clean_female.to_pandas(), 
+                        presets= 'experimental_quality',
+    # best_quality, high_quality, medium_quality, 'experimental_quality',                         
+                        time_limit = 18500,
+                        # num_gpus=1,
+#                        raise_on_no_models_fitted = True,
+                        dynamic_stacking=False, 
+                        num_stack_levels=1,
+                        hyperparameters=custom_hyperparameters,
+#                         hyperparameters = my_search_hyperparameters  ,
+#                         hyperparameter_tune_kwargs=hyperparameter_tune_kwargs,
+                        )
+
+
+
+
+
+display (predictor_female.leaderboard())
+
+
+fit_parameters_female = predictor_female.fit_summary(verbosity = 3, show_plot = True)
+display (fit_parameters_female)
+
+
+predictions_male = predictor_male.predict (test_clean_male.to_pandas()) 
+print (predictions_male)
+
+
+predictions_female = predictor_female.predict (test_clean_female.to_pandas()) 
+print (predictions_female)
+
+
+def convert (pred, test) -> pl.DataFrame :
+    converted = pl.Series ("Calories", np.exp(pred) -1) 
+    result = test.select ("id")
+    result = result.with_columns (converted.alias ("Calories"))
+    return result
+
+submission_male = convert (predictions_male, test_clean_male)
+submission_female = convert (predictions_female, test_clean_female)
+
+submission = pl.concat ([submission_male, submission_female])
+
+
+
+if SHORTCUT : 
+    submission = pl.concat ([half_a_cookie_sub_male, half_a_cookie_sub_female])
+
+
+submission.describe()
+
+
+submission.write_csv("submission.csv")
+print ("submission complete")
+
+
+import zipfile
+
+def move_2_zip (directory_path, archive_name):
+
+    """
+    Generated bi Gen AI (Gemini 2.0 flash)
+  Zips a directory and all its subdirectories and files into a zip archive.
+
+  Args:
+    directory_path: The path to the directory to zip.
+    archive_name: The name (including the .zip extension) of the zip archive to create.
+
+  Returns:
+    True if the zipping was successful, False otherwise.
+    Prints error messages to the console if any issues occur.
+  """
+    try:
+        with zipfile.ZipFile(archive_name, 'w', zipfile.ZIP_DEFLATED) as zipf:
+          for root, _, files in os.walk(directory_path):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                relative_path = os.path.relpath(file_path, directory_path)  # Path relative to the root directory
+                try:
+                    zipf.write(file_path, relative_path)
+                    os.remove(file_path) #Remove file after successful zip
+                except Exception as e:
+                    print(f"Error zipping/deleting file {filename}: {e}")
+                    return False
+
+        print(f"Successfully zipped '{directory_path}' to '{archive_name}' and deleted original files.")
+        return True
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return False
+
+
+move_2_zip ("/kaggle/working/Autogluon", "/kaggle/working/artifacts")
+
